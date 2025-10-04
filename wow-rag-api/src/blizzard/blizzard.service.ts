@@ -19,6 +19,13 @@ export class BlizzardService {
   ) {}
 
   /**
+   * Get OAuth region (CN uses gateway.battlenet.com.cn, others use same region)
+   */
+  private getOAuthRegion(region: string): string {
+    return region === 'cn' ? 'gateway.battlenet.com.cn' : `${region}.battle.net`;
+  }
+
+  /**
    * Get OAuth access token from Blizzard
    */
   private async getAccessToken(): Promise<string> {
@@ -32,26 +39,36 @@ export class BlizzardService {
     const clientSecret = this.configService.get<string>('BLIZZARD_CLIENT_SECRET');
     const region = this.configService.get<string>('BLIZZARD_REGION', 'us');
 
+    if (!clientId || !clientSecret) {
+      throw new Error('BLIZZARD_CLIENT_ID and BLIZZARD_CLIENT_SECRET are required');
+    }
+
     const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    const oauthHost = this.getOAuthRegion(region);
 
-    const response = await firstValueFrom(
-      this.httpService.post<BlizzardToken>(
-        `https://${region}.battle.net/oauth/token`,
-        'grant_type=client_credentials',
-        {
-          headers: {
-            'Authorization': `Basic ${auth}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
+    try {
+      const response = await firstValueFrom(
+        this.httpService.post<BlizzardToken>(
+          `https://${oauthHost}/oauth/token`,
+          'grant_type=client_credentials',
+          {
+            headers: {
+              'Authorization': `Basic ${auth}`,
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
           },
-        },
-      ),
-    );
+        ),
+      );
 
-    this.accessToken = response.data.access_token;
-    this.tokenExpiry = now + (response.data.expires_in * 1000) - 60000; // Refresh 1 min before expiry
+      this.accessToken = response.data.access_token;
+      this.tokenExpiry = now + (response.data.expires_in * 1000) - 60000; // Refresh 1 min before expiry
 
-    this.logger.log('Successfully obtained Blizzard access token');
-    return this.accessToken!;
+      this.logger.log('Successfully obtained Blizzard access token');
+      return this.accessToken!;
+    } catch (error) {
+      this.logger.error('Failed to obtain Blizzard access token', error);
+      throw new Error('Failed to authenticate with Blizzard API');
+    }
   }
 
   /**
@@ -62,17 +79,22 @@ export class BlizzardService {
     const region = this.configService.get<string>('BLIZZARD_REGION', 'us');
     const namespace = `dynamic-${region}`;
 
-    const response = await firstValueFrom(
-      this.httpService.get(
-        `https://${region}.api.blizzard.com/data/wow/realm/${realmSlug}`,
-        {
-          params: { namespace, locale: 'en_US' },
-          headers: { Authorization: `Bearer ${token}` },
-        },
-      ),
-    );
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get(
+          `https://${region}.api.blizzard.com/data/wow/realm/${realmSlug}`,
+          {
+            params: { namespace, locale: 'en_US' },
+            headers: { Authorization: `Bearer ${token}` },
+          },
+        ),
+      );
 
-    return response.data;
+      return response.data;
+    } catch (error) {
+      this.logger.error(`Failed to fetch realm data for ${realmSlug}`, error);
+      throw new Error(`Failed to fetch realm data: ${realmSlug}`);
+    }
   }
 
   /**
@@ -83,17 +105,22 @@ export class BlizzardService {
     const region = this.configService.get<string>('BLIZZARD_REGION', 'us');
     const namespace = `profile-${region}`;
 
-    const response = await firstValueFrom(
-      this.httpService.get(
-        `https://${region}.api.blizzard.com/profile/wow/character/${realmSlug}/${characterName.toLowerCase()}`,
-        {
-          params: { namespace, locale: 'en_US' },
-          headers: { Authorization: `Bearer ${token}` },
-        },
-      ),
-    );
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get(
+          `https://${region}.api.blizzard.com/profile/wow/character/${realmSlug}/${characterName.toLowerCase()}`,
+          {
+            params: { namespace, locale: 'en_US' },
+            headers: { Authorization: `Bearer ${token}` },
+          },
+        ),
+      );
 
-    return response.data;
+      return response.data;
+    } catch (error) {
+      this.logger.error(`Failed to fetch character ${characterName} on ${realmSlug}`, error);
+      throw new Error(`Failed to fetch character: ${characterName}@${realmSlug}`);
+    }
   }
 
   /**
@@ -104,22 +131,27 @@ export class BlizzardService {
     const region = this.configService.get<string>('BLIZZARD_REGION', 'us');
     const namespace = `static-${region}`;
 
-    const response = await firstValueFrom(
-      this.httpService.get(
-        `https://${region}.api.blizzard.com/data/wow/search/item`,
-        {
-          params: {
-            namespace,
-            locale: 'en_US',
-            'name.en_US': query,
-            orderby: 'name',
-            _page: 1,
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get(
+          `https://${region}.api.blizzard.com/data/wow/search/item`,
+          {
+            params: {
+              namespace,
+              locale: 'en_US',
+              'name.en_US': query,
+              orderby: 'name',
+              _page: 1,
+            },
+            headers: { Authorization: `Bearer ${token}` },
           },
-          headers: { Authorization: `Bearer ${token}` },
-        },
-      ),
-    );
+        ),
+      );
 
-    return response.data;
+      return response.data;
+    } catch (error) {
+      this.logger.error(`Failed to search items with query: ${query}`, error);
+      throw new Error(`Failed to search items: ${query}`);
+    }
   }
 }
