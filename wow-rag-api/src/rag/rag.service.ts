@@ -1,9 +1,9 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { FaissStore } from '@langchain/community/vectorstores/faiss';
+import { MemoryVectorStore } from 'langchain/vectorstores/memory';
+import { HuggingFaceInferenceEmbeddings } from '@langchain/community/embeddings/hf';
 import { Document } from 'langchain/document';
 import { BlizzardService } from '../blizzard/blizzard.service';
-import { HuggingFaceEmbeddings } from './embeddings/huggingface.embeddings';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as csvParser from 'csv-parser';
@@ -14,10 +14,9 @@ import * as csvParser from 'csv-parser';
 @Injectable()
 export class RagService implements OnModuleInit {
   private readonly logger = new Logger(RagService.name);
-  private vectorStore: FaissStore | null = null;
+  private vectorStore: MemoryVectorStore | null = null;
   private apiKey: string;
-  private embeddings: HuggingFaceEmbeddings;
-  private readonly vectorStorePath = path.join(process.cwd(), 'vectorstore');
+  private embeddings: HuggingFaceInferenceEmbeddings;
   private readonly dataPath = path.join(process.cwd(), 'data', 'initial-knowledge.csv');
 
   constructor(
@@ -31,7 +30,10 @@ export class RagService implements OnModuleInit {
     }
 
     this.apiKey = apiKey;
-    this.embeddings = new HuggingFaceEmbeddings({ apiKey });
+    this.embeddings = new HuggingFaceInferenceEmbeddings({
+      apiKey,
+      model: 'sentence-transformers/all-MiniLM-L6-v2',
+    });
   }
 
   async onModuleInit() {
@@ -42,21 +44,11 @@ export class RagService implements OnModuleInit {
    * Initialize or load vector store
    */
   private async initializeVectorStore(): Promise<void> {
-    try {
-      // Try to load existing vector store
-      this.vectorStore = await FaissStore.load(
-        this.vectorStorePath,
-        this.embeddings,
-      );
-      this.logger.log('Loaded existing vector store');
-    } catch (error) {
-      // Create new vector store if doesn't exist
-      this.logger.log('Creating new vector store from CSV data');
-      const docs = await this.loadInitialDocuments();
-      this.vectorStore = await FaissStore.fromDocuments(docs, this.embeddings);
-      await this.vectorStore.save(this.vectorStorePath);
-      this.logger.log('Vector store created and saved');
-    }
+    // MemoryVectorStore doesn't persist, so always create from docs
+    this.logger.log('Creating new vector store from CSV data');
+    const docs = await this.loadInitialDocuments();
+    this.vectorStore = await MemoryVectorStore.fromDocuments(docs, this.embeddings);
+    this.logger.log('Vector store created in memory');
   }
 
   /**
@@ -112,8 +104,7 @@ export class RagService implements OnModuleInit {
     });
 
     await this.vectorStore.addDocuments([doc]);
-    await this.vectorStore.save(this.vectorStorePath);
-    this.logger.log('Document added to vector store');
+    this.logger.log('Document added to vector store (in-memory only)');
   }
 
   /**

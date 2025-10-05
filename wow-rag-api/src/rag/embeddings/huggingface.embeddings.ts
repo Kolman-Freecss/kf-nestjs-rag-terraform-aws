@@ -30,6 +30,7 @@ export class HuggingFaceEmbeddings extends Embeddings {
 
   /**
    * Call HuggingFace Inference API for embeddings
+   * Uses feature-extraction task with source_sentence format
    */
   private async callEmbeddingAPI(text: string): Promise<number[]> {
     const response = await fetch(
@@ -40,15 +41,44 @@ export class HuggingFaceEmbeddings extends Embeddings {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ inputs: text }),
+        body: JSON.stringify({
+          inputs: {
+            source_sentence: text,
+            sentences: [text], // Required by SentenceSimilarityPipeline
+          },
+          options: { wait_for_model: true },
+        }),
       },
     );
 
     if (!response.ok) {
-      throw new Error(`HuggingFace API error: ${response.statusText}`);
+      const errorText = await response.text();
+      throw new Error(`HuggingFace API error: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
     const data = await response.json();
-    return Array.isArray(data) ? data : data.embeddings || data[0];
+
+    // For sentence similarity, we get back similarity scores
+    // We need to use feature extraction instead
+    // Let's try a different approach - using the model for feature extraction directly
+    if (Array.isArray(data)) {
+      // If it's similarity scores, we need a different approach
+      if (typeof data[0] === 'number' && data.length < 100) {
+        // This looks like similarity scores, not embeddings
+        // We need to call the API differently
+        throw new Error('Received similarity scores instead of embeddings. Model configuration issue.');
+      }
+
+      // If it's a 2D array (batch of 1), take the first element
+      if (Array.isArray(data[0]) && typeof data[0][0] === 'number') {
+        return data[0];
+      }
+      // If it's already a 1D array of numbers (embeddings should be 384-dimensional)
+      if (typeof data[0] === 'number') {
+        return data;
+      }
+    }
+
+    throw new Error(`Unexpected response format from HuggingFace API: ${JSON.stringify(data).slice(0, 200)}`);
   }
 }

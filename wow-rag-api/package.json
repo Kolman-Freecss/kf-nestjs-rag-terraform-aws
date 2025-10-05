@@ -14,6 +14,7 @@
   "license": "ISC",
   "packageManager": "pnpm@10.18.0",
   "dependencies": {
+    "@huggingface/inference": "^4.11.0",
     "@langchain/community": "^0.3.57",
     "@langchain/core": "^0.3.78",
     "@langchain/openai": "^0.6.14",
@@ -24,6 +25,7 @@
     "@nestjs/platform-express": "^11.1.6",
     "axios": "^1.12.2",
     "faiss-node": "^0.5.1",
+    "hnswlib-node": "^3.0.0",
     "langchain": "^0.3.35",
     "reflect-metadata": "~0.2.2",
     "rxjs": "^7.8.2"
