@@ -43,7 +43,7 @@ curl -X POST http://localhost:3000/rag/query \
 2. **RAG Module** (`src/rag/`)
    - Uses **MemoryVectorStore** (in-memory, no persistence - restarts from CSV on each boot)
    - Embeddings via HuggingFace Inference API (`sentence-transformers/all-MiniLM-L6-v2`)
-   - LLM queries sent to DeepSeek-V3.2-Exp via HuggingFace
+   - Returns context-based responses (LLM integration ready for OpenAI/Anthropic/etc.)
    - Keyword detection for live Blizzard API integration (e.g., "realm" triggers API call)
 
 ### Key Design Patterns
@@ -76,11 +76,11 @@ private getOAuthRegion(region: string): string {
 
 ### RAG Query Pipeline
 1. User submits question → `RagController.query()`
-2. Vector similarity search retrieves top 3 relevant docs
+2. Vector similarity search retrieves top 3 relevant docs using HuggingFace embeddings
 3. Keyword detection checks for "realm" to fetch live Blizzard data
 4. Context built from: retrieved docs + optional Blizzard API response
-5. Prompt sent to DeepSeek-V3.2-Exp via HuggingFace Inference API
-6. Generated answer returned to user
+5. Response assembled from context (for LLM integration, configure OpenAI/Anthropic API)
+6. Formatted answer returned to user
 
 ### Vector Store Limitations
 **Important**: Using `MemoryVectorStore` means:
@@ -126,9 +126,11 @@ if (question.toLowerCase().includes('character')) {
 1. **Working Directory**: Commands must run in `wow-rag-api/`, not repo root
 2. **Package Manager**: Use `pnpm`, not `npm` or `yarn`
 3. **Native Dependencies**: `faiss-node` and `hnswlib-node` require compilation - that's why we use `MemoryVectorStore`
-4. **API Keys**: HuggingFace key must have "Read" permissions for Inference API
+4. **API Keys**: HuggingFace key must have "Read" permissions for embeddings (LLM generation currently disabled due to free tier limits)
 5. **Blizzard Regions**: China (CN) has different OAuth endpoint
 6. **Vector Store**: Changes via `/rag/documents` are ephemeral (memory-only)
+7. **CSV Data**: Ensure no empty rows in `initial-knowledge.csv` to prevent embedding errors
+8. **Realm Names**: Use lowercase with hyphens (e.g., "area-52" not "Area 52") in queries
 
 ## Code Style
 
