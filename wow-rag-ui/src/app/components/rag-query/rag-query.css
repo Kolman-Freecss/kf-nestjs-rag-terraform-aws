@@ -1,0 +1,6 @@
+/* GSAP SplitText animation styles */
+.char {
+  display: inline-block;
+  transform-origin: center center;
+  perspective: 1000px;
+}

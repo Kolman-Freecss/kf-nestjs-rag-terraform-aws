@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #667eea;
+  --color-primary-dark: #764ba2;
+}
+
+/* Global styles */
+body {
+  @apply m-0 p-0 font-sans antialiased;
+}
