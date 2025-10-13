@@ -16,8 +16,8 @@ import * as csvParser from 'csv-parser';
 export class RagService implements OnModuleInit {
   private readonly logger = new Logger(RagService.name);
   private vectorStore: MemoryVectorStore | null = null;
-  private embeddings: HuggingFaceInferenceEmbeddings;
-  private apiKey: string;
+  private readonly embeddings: HuggingFaceInferenceEmbeddings;
+  private readonly apiKey: string;
   private readonly dataPath = path.join(process.cwd(), 'data', 'initial-knowledge.csv');
 
   constructor(
@@ -118,20 +118,24 @@ export class RagService implements OnModuleInit {
     if (!this.vectorStore) {
       throw new Error('Vector store not initialized');
     }
+    // Retrieve relevant documents (fetch more and rerank)
+    const retrieved = await this.vectorStore.similaritySearch(question, 8);
 
-    // Retrieve relevant documents
-    const relevantDocs = await this.vectorStore.similaritySearch(question, 3);
+    // Simple lexical reranking to improve relevance (cheap fallback to no extra infra)
+    const relevantDocs = this.rerankDocuments(question, retrieved).slice(0, 6);
 
     // Try to fetch live data from Blizzard API if question seems related
     let blizzardContext = '';
     try {
       // Simple keyword matching for demonstration
-      if (question.toLowerCase().includes('realm')) {
+      const hasRealm = question.toLowerCase().includes('realm');
+      if (hasRealm) {
         // Match realm name - includes letters, numbers, hyphens, and apostrophes
         // Examples: "Area-52", "Burning Blade", "Kil'jaeden"
-        const match = question.match(/realm\s+([\w-']+(?:\s+[\w-']+)*)/i);
-        if (match) {
-          const realmSlug = match[1].toLowerCase().replace(/\s+/g, '-').replace(/'/g, '');
+        const re = /realm\s+([\w-']+(?:\s+[\w-']+)*)/i;
+        const m = re.exec(question);
+        if (m?.[1]) {
+          const realmSlug = m[1].toLowerCase().replace(/\s+/g, '-').replace(/'/g, '');
           const realmData = await this.blizzardService.getRealmData(realmSlug);
           blizzardContext = `\n\nLive Blizzard API Data:\n${JSON.stringify(realmData, null, 2)}`;
         }
@@ -139,96 +143,153 @@ export class RagService implements OnModuleInit {
     } catch (error) {
       this.logger.warn('Could not fetch Blizzard API data:', error);
     }
+    // Build context with a character budget to avoid exceeding LLM input limits
+    const { context, docIndexMap } = this.buildContextFromDocs(relevantDocs, 3000);
 
-    // Create context from retrieved documents
-    const context = relevantDocs
-      .map((doc) => doc.pageContent)
-      .join('\n\n');
-
-    // Build prompt for the LLM - using a format optimized for smaller models
-    const prompt = `Answer this question about World of Warcraft using only the information provided.
+    // Build prompt template instructing the model to cite sources and be grounded
+    const prompt = `You are a helpful assistant answering questions strictly using only the supplied information and live data. Be concise and factual. For any factual claim include citations to the provided documents using the notation [doc:N]. If you cannot answer confidently from the provided information, say "I don't know" and list the relevant documents.
 
 Information:
 ${context}${blizzardContext}
 
 Question: ${question}
 
-Answer:`;
+Answer (include citations like [doc:1], [doc:2] when applicable):`;
 
-    // Try to query HuggingFace LLM with multiple fallback models
-    const models = [
-      'mistralai/Mistral-7B-Instruct-v0.3', // Try Mistral first (instruction-tuned)
-      'google/flan-t5-xxl',                  // Google's T5 model
-      'bigscience/bloom-560m',               // BLOOM smaller model
-    ];
+    // Try models with verification and backoff
+    const modelList = ['mistralai/Mistral-7B-Instruct-v0.3', 'google/flan-t5-xl', 'bigscience/bloom-560m'];
+    const answer = await this.tryModelsWithVerification(modelList, prompt, context, docIndexMap);
+    if (answer) return answer;
 
+    // As a safe fallback, return the retrieved context with guidance
+    this.logger.warn('All LLM models failed verification or unavailable, returning retrieved context');
+    return `Based on the World of Warcraft knowledge base (retrieved documents):\n\n${context}${blizzardContext}\n\n⚠️ Note: The system could not produce a verified AI answer; please check the sources above.`;
+  }
+
+  /** Try a list of models with retries, verification and backoff. Returns verified answer or empty string */
+  private async tryModelsWithVerification(models: string[], prompt: string, context: string, docIndexMap: Record<number, Document>): Promise<string> {
     for (const model of models) {
-      try {
-        this.logger.log(`Trying model: ${model}`);
+      let attempt = 0;
+      const maxAttempts = 3;
+      while (attempt < maxAttempts) {
+        attempt += 1;
+        try {
+          this.logger.log(`Calling model ${model} (attempt ${attempt})`);
+          const generated = await this.callHfModel(model, prompt, {
+            max_new_tokens: 300, // limit response length
+            temperature: 0.0, // deterministic
+            top_p: 1.0, // no nucleus sampling for consistency
+            do_sample: false, // no sampling for consistency
+            return_full_text: false, // only return generated part
+            stop: ['\n\n'], // stop at double newline
+          });
 
-        const response = await fetch(
-          `https://api-inference.huggingface.co/models/${model}`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${this.apiKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              inputs: prompt,
-              parameters: {
-                max_new_tokens: 300,
-                temperature: 0.7,
-                top_p: 0.95,
-                do_sample: true,
-                return_full_text: false,
-              },
-              options: {
-                wait_for_model: false, // Don't wait if model is loading
-                use_cache: true,
-              },
-            }),
-          },
-        );
+          if (!generated || generated.trim().length === 0) {
+            this.logger.warn(`Model ${model} returned empty response`);
+            continue;
+          }
 
-        if (!response.ok) {
-          const errorText = await response.text();
-          this.logger.warn(`Model ${model} failed: ${response.status} - ${errorText}`);
-          continue; // Try next model
+          this.logger.log(`Model ${model} returned an answer, running verifier`);
+          const verification = await this.verifyAnswer(model, generated.trim(), context, docIndexMap);
+          if (verification?.confident) return generated.trim();
+          this.logger.warn(`Model ${model} verification failed or not confident: ${verification?.reason || 'unknown'}`);
+        } catch (error) {
+          this.logger.error(`Error calling model ${model}: ${error?.message || error}`);
+          await this.sleep(500 * attempt);
         }
-
-        const data = await response.json();
-
-        // Check if model is loading
-        if (data.error && data.error.includes('loading')) {
-          this.logger.warn(`Model ${model} is loading, trying next...`);
-          continue;
-        }
-
-        // Extract generated text from various response formats
-        let generatedText = '';
-        if (Array.isArray(data) && data.length > 0) {
-          generatedText = data[0].generated_text || data[0].text || '';
-        } else if (data.generated_text) {
-          generatedText = data.generated_text;
-        } else if (typeof data === 'string') {
-          generatedText = data;
-        }
-
-        if (generatedText && generatedText.trim().length > 0) {
-          this.logger.log(`Successfully got response from ${model}`);
-          return generatedText.trim();
-        }
-
-        this.logger.warn(`Model ${model} returned empty response`);
-      } catch (error) {
-        this.logger.error(`Error with model ${model}:`, error.message);
-        continue; // Try next model
       }
     }
+    return '';
+  }
 
-    // If all models failed, return context directly
-    this.logger.warn('All LLM models failed or unavailable, returning context directly');
-    return `Based on the World of Warcraft knowledge base:\n\n${context}${blizzardContext}\n\n⚠️ Note: AI generation currently unavailable. The free tier models may be loading or rate limited. Showing retrieved information instead.`;
+  /**
+   * Rerank documents with a cheap lexical overlap scorer.
+   * This provides a simple re-ordering without additional API calls.
+   */
+  private rerankDocuments(question: string, docs: Document[]): Document[] {
+    const qTokens = question.toLowerCase().split(/[^\w']+/).filter(Boolean);
+    return docs
+      .map((doc) => {
+        const text = (doc.pageContent || '').toLowerCase();
+        const tokens = text.split(/[^\w']+/).filter(Boolean);
+        // overlap score
+        const overlap = qTokens.reduce((acc, t) => acc + (tokens.includes(t) ? 1 : 0), 0);
+        const norm = tokens.length ? overlap / tokens.length : 0;
+        return { doc, score: norm };
+      })
+      .sort((a, b) => b.score - a.score)
+      .map((x) => x.doc);
+  }
+
+  /** Build a context string from documents but cap by character budget. Returns a map of doc indices used. */
+  private buildContextFromDocs(docs: Document[], maxChars = 3000): { context: string; docIndexMap: Record<number, Document> } {
+    let chars = 0;
+    const parts: string[] = [];
+    const map: Record<number, Document> = {};
+    for (let i = 0; i < docs.length; i++) {
+      const doc = docs[i];
+      const header = `[doc:${i + 1} | topic:${doc.metadata?.topic || 'unknown'} | source:${doc.metadata?.source || 'unknown'}]\n`;
+      const text = `${header}${doc.pageContent}\n---\n`;
+      if (chars + text.length > maxChars) break;
+      parts.push(text);
+      map[i + 1] = doc;
+      chars += text.length;
+    }
+    return { context: parts.join('\n'), docIndexMap: map };
+  }
+
+  /** Call the HuggingFace Inference API for a given model and prompt. */
+  private async callHfModel(model: string, prompt: string, params: Record<string, any>): Promise<string> {
+    const response = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ inputs: prompt, parameters: params, options: { wait_for_model: false, use_cache: true } }),
+    });
+
+    if (!response.ok) {
+      const txt = await response.text();
+      this.logger.warn(`HF model ${model} returned status ${response.status}: ${txt}`);
+      return '';
+    }
+
+    const data = await response.json();
+    if (data.error && typeof data.error === 'string' && data.error.includes('loading')) {
+      this.logger.warn(`Model ${model} is loading`);
+      return '';
+    }
+
+    let generated = '';
+    if (Array.isArray(data) && data.length > 0) {
+      generated = data[0].generated_text || data[0].text || '';
+    } else if (data.generated_text) {
+      generated = data.generated_text;
+    } else if (typeof data === 'string') {
+      generated = data;
+    }
+    return generated || '';
+  }
+
+  /** Verification step: ask the LLM to check that the answer's claims are supported by the context. */
+  private async verifyAnswer(model: string, answer: string, context: string, docIndexMap: Record<number, Document>): Promise<{ confident: boolean; reason?: string }> {
+    // The verifier prompt asks the model to match citations in the answer against context
+    const verifierPrompt = `You are a verifier. Given the context documents and an answer, check whether each factual claim in the answer is fully supported by the context. If all claims are supported, reply with:\n"VERIFIED\nReason: <short explanation>"\nIf some claims are NOT supported reply with:\n"NOT VERIFIED\nUnsupported: <short list of unsupported claims>"\n\nContext:\n${context}\n\nAnswer:\n${answer}\n\nResult:`;
+
+    try {
+      const v = await this.callHfModel(model, verifierPrompt, { max_new_tokens: 200, temperature: 0.0, do_sample: false });
+      if (!v) return { confident: false, reason: 'no verifier response' };
+      const text = v.toLowerCase();
+      if (text.includes('verified')) return { confident: true, reason: 'verifier confirmed' };
+      return { confident: false, reason: v.trim().split('\n')[0] };
+    } catch (error) {
+      this.logger.warn('Verifier error:', error);
+      return { confident: false, reason: 'verifier error' };
+    }
+  }
+
+  private sleep(ms: number) {
+    return new Promise((res) => setTimeout(res, ms));
   }
 }
