@@ -159,9 +159,9 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
 
     // Try models with verification and backoff
     const modelList = [
-      "mistralai/Mistral-7B-Instruct-v0.3",
-      "google/flan-t5-xl",
-      "bigscience/bloom-560m",
+      "google/embeddinggemma-300m",
+      "ibm-granite/granite-embedding-english-r2",
+      "distilbert/distilbert-base-uncased",
     ];
     const answer = await this.tryModelsWithVerification(modelList, prompt, context, docIndexMap);
     if (answer) return answer;

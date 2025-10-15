@@ -18,6 +18,11 @@ NestJS-based API that integrates Blizzard's World of Warcraft API with a RAG (Re
 - **Vector Store**: FAISS with LangChain.js
 - **Embeddings**: sentence-transformers/all-MiniLM-L6-v2
 - **HTTP Client**: Axios
+- **Hugging Faces**: HuggingFace Inference API
+  - It allows to use the HuggingFace Inference API to call the models
+  - https://huggingface.co/docs/huggingface_hub/v0.13.2/en/guides/inference
+  - Note. Take into an account that those models are being used through HF Inference API, then they need to be available in the inference API.
+  - https://huggingface.co/models?inference_provider=hf-inference&sort=trending
 
 ## Project Structure
 
