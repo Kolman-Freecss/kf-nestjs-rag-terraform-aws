@@ -9,7 +9,7 @@ import * as fs from "fs";
 import * as csvParser from "csv-parser";
 
 /**
- * Service for RAG (Retrieval Augmented Generation) operations
+ * Simplified RAG Service with basic functionality
  * Uses vector similarity search and LLM to generate responses
  */
 @Injectable()
@@ -112,7 +112,7 @@ export class RagService implements OnModuleInit {
   }
 
   /**
-   * Query using RAG with DeepSeek and Blizzard API integration
+   * Query using basic RAG with vector search and text generation
    */
   async query(question: string): Promise<string> {
     if (!this.vectorStore) {
@@ -158,10 +158,10 @@ Question: ${question}
 Answer (include citations like [doc:1], [doc:2] when applicable):`;
 
     // Try models with verification and backoff
+    // Note: similarity models are not suitable for text generation, so we use text generation models
     const modelList = [
-      "google/embeddinggemma-300m",
-      "ibm-granite/granite-embedding-english-r2",
-      "distilbert/distilbert-base-uncased",
+      "katanemo/Arch-Router-1.5B", // Text generation model
+      "HuggingFaceTB/SmolLM3-3B", // Text generation model
     ];
     const answer = await this.tryModelsWithVerification(modelList, prompt, context, docIndexMap);
     if (answer) return answer;
@@ -187,14 +187,7 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
         attempt += 1;
         try {
           this.logger.log(`Calling model ${model} (attempt ${attempt})`);
-          const generated = await this.callHfModel(model, prompt, {
-            max_new_tokens: 300, // limit response length
-            temperature: 0.0, // deterministic
-            top_p: 1.0, // no nucleus sampling for consistency
-            do_sample: false, // no sampling for consistency
-            return_full_text: false, // only return generated part
-            stop: ["\n\n"], // stop at double newline
-          });
+          const generated = await this.callHfModel(model, prompt, {});
 
           if (!generated || generated.trim().length === 0) {
             this.logger.warn(`Model ${model} returned empty response`);
@@ -280,17 +273,26 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
     prompt: string,
     params: Record<string, any>,
   ): Promise<string> {
-    const response = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+    // Use chat completions endpoint for the new models
+    const endpoint = "https://router.huggingface.co/v1/chat/completions";
+
+    const requestBody = {
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      model: `${model}:hf-inference`,
+    };
+
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        inputs: prompt,
-        parameters: params,
-        options: { wait_for_model: false, use_cache: true },
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     if (!response.ok) {
@@ -300,20 +302,13 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
     }
 
     const data = await response.json();
-    if (data.error && typeof data.error === "string" && data.error.includes("loading")) {
-      this.logger.warn(`Model ${model} is loading`);
+    if (data.error) {
+      this.logger.warn(`Model ${model} error:`, data.error);
       return "";
     }
 
-    let generated = "";
-    if (Array.isArray(data) && data.length > 0) {
-      generated = data[0].generated_text || data[0].text || "";
-    } else if (data.generated_text) {
-      generated = data.generated_text;
-    } else if (typeof data === "string") {
-      generated = data;
-    }
-    return generated || "";
+    // Extract the response from chat completion format
+    return data.choices?.[0]?.message?.content || "";
   }
 
   /** Verification step: ask the LLM to check that the answer's claims are supported by the context.
@@ -332,11 +327,7 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
     const verifierPrompt = `You are a verifier. Given the context documents and an answer, check whether each factual claim in the answer is fully supported by the context. If all claims are supported, reply with:\n"VERIFIED\nReason: <short explanation>"\nIf some claims are NOT supported reply with:\n"NOT VERIFIED\nUnsupported: <short list of unsupported claims>"\n\nContext:\n${context}\n\nAnswer:\n${answer}\n\nResult:`;
 
     try {
-      const v = await this.callHfModel(model, verifierPrompt, {
-        max_new_tokens: 200,
-        temperature: 0.0,
-        do_sample: false,
-      });
+      const v = await this.callHfModel(model, verifierPrompt, {});
       if (!v) return { confident: false, reason: "no verifier response" };
       const text = v.toLowerCase();
       if (text.includes("verified")) return { confident: true, reason: "verifier confirmed" };
