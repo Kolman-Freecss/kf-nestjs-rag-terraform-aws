@@ -286,6 +286,8 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
       model: `${model}:hf-inference`,
     };
 
+    this.logger.log(`Calling model ${model} | params: ${JSON.stringify(params)} | endpoint: ${endpoint}`);
+
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -328,6 +330,7 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
 
     try {
       const v = await this.callHfModel(model, verifierPrompt, {});
+      this.logger.log(`Verifier result: ${v}`);
       if (!v) return { confident: false, reason: "no verifier response" };
       const text = v.toLowerCase();
       if (text.includes("verified")) return { confident: true, reason: "verifier confirmed" };
