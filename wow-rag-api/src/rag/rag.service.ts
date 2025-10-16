@@ -4,13 +4,20 @@ import { MemoryVectorStore } from "langchain/vectorstores/memory";
 import { HuggingFaceInferenceEmbeddings } from "@langchain/community/embeddings/hf";
 import { Document } from "langchain/document";
 import { BlizzardService } from "../blizzard/blizzard.service";
+import { ModelFactory } from "./models/factory/model.factory";
+import { AgentOrchestratorImpl } from "./agents/orchestrator/agent.orchestrator";
+import { SimilarityAgentImpl } from "./agents/implementations/similarity.agent";
+import { GenerationAgentImpl } from "./agents/implementations/generation.agent";
+import { RAGConfigLoader, RAGConfig } from "./config/rag.config";
+import { ModelType, SimilarityClient, TextGenerationClient } from "./models/interfaces/model.interfaces";
+import { AgentType, AgentContext } from "./agents/interfaces/agent.interfaces";
 import * as path from "path";
 import * as fs from "fs";
 import * as csvParser from "csv-parser";
 
 /**
- * Service for RAG (Retrieval Augmented Generation) operations
- * Uses vector similarity search and LLM to generate responses
+ * Enhanced RAG Service with multi-agent architecture and scalable model management
+ * Supports multiple HuggingFace models with different API patterns
  */
 @Injectable()
 export class RagService implements OnModuleInit {
@@ -19,10 +26,15 @@ export class RagService implements OnModuleInit {
   private readonly embeddings: HuggingFaceInferenceEmbeddings;
   private readonly apiKey: string;
   private readonly dataPath = path.join(process.cwd(), "data", "initial-knowledge.csv");
+  private readonly config: RAGConfig;
+  private readonly orchestrator: AgentOrchestratorImpl;
+  private similarityAgent: SimilarityAgentImpl | null = null;
+  private generationAgent: GenerationAgentImpl | null = null;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly blizzardService: BlizzardService,
+    private readonly modelFactory: ModelFactory,
   ) {
     const apiKey = this.configService.get<string>("HUGGINGFACE_API_KEY");
 
@@ -31,16 +43,21 @@ export class RagService implements OnModuleInit {
     }
 
     this.apiKey = apiKey;
+    this.config = RAGConfigLoader.loadFromEnv();
+    this.orchestrator = new AgentOrchestratorImpl();
+
+    // Keep backward compatibility with existing embedding system
     this.embeddings = new HuggingFaceInferenceEmbeddings({
       apiKey,
       model: "sentence-transformers/all-MiniLM-L6-v2",
     });
 
-    this.logger.log("RAG Service initialized");
+    this.logger.log("Enhanced RAG Service initialized with multi-agent architecture");
   }
 
   async onModuleInit() {
     await this.initializeVectorStore();
+    await this.initializeAgents();
   }
 
   /**
@@ -52,6 +69,58 @@ export class RagService implements OnModuleInit {
     const docs = await this.loadInitialDocuments();
     this.vectorStore = await MemoryVectorStore.fromDocuments(docs, this.embeddings);
     this.logger.log("Vector store created in memory");
+  }
+
+  /**
+   * Initialize agents for multi-agent RAG workflow
+   */
+  private async initializeAgents(): Promise<void> {
+    try {
+      // Initialize similarity agent
+      if (this.config.agents.enabled[AgentType.SIMILARITY]) {
+        const similarityConfig = this.config.agents.instances['primary-similarity'];
+        if (similarityConfig) {
+          this.similarityAgent = new SimilarityAgentImpl(
+            {
+              name: 'primary-similarity',
+              modelNames: similarityConfig.models,
+              fallbackModels: similarityConfig.fallbackModels,
+              maxRetries: similarityConfig.maxRetries,
+              timeout: similarityConfig.timeout,
+              customSettings: similarityConfig.customSettings,
+            },
+            this.modelFactory,
+          );
+          await this.similarityAgent.initialize();
+          this.orchestrator.registerAgent(this.similarityAgent);
+        }
+      }
+
+      // Initialize generation agent
+      if (this.config.agents.enabled[AgentType.GENERATION]) {
+        const generationConfig = this.config.agents.instances['primary-generation'];
+        if (generationConfig) {
+          this.generationAgent = new GenerationAgentImpl(
+            {
+              name: 'primary-generation',
+              modelNames: generationConfig.models,
+              fallbackModels: generationConfig.fallbackModels,
+              maxRetries: generationConfig.maxRetries,
+              timeout: generationConfig.timeout,
+              customSettings: generationConfig.customSettings,
+            },
+            this.modelFactory,
+          );
+          await this.generationAgent.initialize();
+          this.orchestrator.registerAgent(this.generationAgent);
+        }
+      }
+
+      this.logger.log("Multi-agent system initialized successfully");
+    } catch (error) {
+      this.logger.error("Failed to initialize agents:", error);
+      throw error;
+    }
   }
 
   /**
@@ -112,38 +181,133 @@ export class RagService implements OnModuleInit {
   }
 
   /**
-   * Query using RAG with DeepSeek and Blizzard API integration
+   * Enhanced query method using multi-agent RAG architecture
+   * Supports different model types and provides fallback mechanisms
    */
   async query(question: string): Promise<string> {
     if (!this.vectorStore) {
       throw new Error("Vector store not initialized");
     }
+
+    try {
+      // Use the new multi-agent approach if agents are available
+      if (this.similarityAgent && this.generationAgent) {
+        return await this.queryWithAgents(question);
+      }
+
+      // Fallback to legacy approach
+      return await this.queryLegacy(question);
+    } catch (error) {
+      this.logger.error("Query failed:", error);
+      
+      // Final fallback to legacy approach
+      try {
+        return await this.queryLegacy(question);
+      } catch (fallbackError) {
+        this.logger.error("Fallback query also failed:", fallbackError);
+        return `I apologize, but I'm unable to process your question at the moment due to technical difficulties. Please try again later.`;
+      }
+    }
+  }
+
+  /**
+   * Query using the new multi-agent architecture
+   */
+  private async queryWithAgents(question: string): Promise<string> {
+    // Step 1: Retrieve relevant documents
+    const retrieved = await this.vectorStore!.similaritySearch(
+      question, 
+      this.config.retrieval.defaultTopK + 2
+    );
+
+    // Step 2: Use similarity agent for reranking if enabled
+    let relevantDocs = retrieved;
+    if (this.similarityAgent && this.config.retrieval.rerankingEnabled) {
+      const rankingResult = await this.similarityAgent.hybridRankDocuments(
+        question,
+        retrieved,
+        this.config.retrieval.hybridWeights.semantic,
+        this.config.retrieval.hybridWeights.lexical,
+      );
+      
+      if (rankingResult.success) {
+        relevantDocs = rankingResult.data!.slice(0, this.config.retrieval.defaultTopK);
+        this.logger.log(`Documents reranked using ${this.similarityAgent.name}`);
+      } else {
+        this.logger.warn("Document reranking failed, using original order");
+        relevantDocs = retrieved.slice(0, this.config.retrieval.defaultTopK);
+      }
+    } else {
+      relevantDocs = retrieved.slice(0, this.config.retrieval.defaultTopK);
+    }
+
+    // Step 3: Fetch Blizzard API data if relevant
+    const blizzardContext = await this.fetchBlizzardContext(question);
+
+    // Step 4: Create agent context
+    const agentContext: AgentContext = {
+      query: question,
+      documents: relevantDocs,
+      metadata: {
+        blizzardContext,
+        retrievalMethod: 'vector-similarity',
+        rerankingUsed: this.config.retrieval.rerankingEnabled,
+      },
+    };
+
+    // Step 5: Use generation agent to create response
+    if (this.generationAgent) {
+      const generationResult = this.config.generation.verificationEnabled
+        ? await this.generationAgent.generateWithVerification(question, agentContext, {
+            maxTokens: this.config.generation.defaultMaxTokens,
+            temperature: this.config.generation.defaultTemperature,
+            topP: this.config.generation.defaultTopP,
+            requireCitations: this.config.generation.requireCitations,
+            includeContext: true,
+            stopSequences: this.config.generation.stopSequences,
+          })
+        : await this.generationAgent.generate(question, agentContext, {
+            maxTokens: this.config.generation.defaultMaxTokens,
+            temperature: this.config.generation.defaultTemperature,
+            topP: this.config.generation.defaultTopP,
+            requireCitations: this.config.generation.requireCitations,
+            includeContext: true,
+            stopSequences: this.config.generation.stopSequences,
+          });
+
+      if (generationResult.success) {
+        const response = this.config.generation.verificationEnabled 
+          ? (generationResult.data as any).text 
+          : generationResult.data as string;
+        
+        // Add metadata about the generation process
+        const metadata = this.config.generation.verificationEnabled 
+          ? `\n\n_Generated using ${generationResult.metadata?.modelUsed || 'unknown model'} (verified: ${(generationResult.data as any).verified}, confidence: ${((generationResult.data as any).confidence * 100).toFixed(1)}%)_`
+          : `\n\n_Generated using ${generationResult.metadata?.modelUsed || 'unknown model'}_`;
+
+        return response + (process.env.NODE_ENV === 'development' ? metadata : '');
+      } else {
+        this.logger.warn("Generation agent failed:", generationResult.error);
+      }
+    }
+
+    // Fallback to legacy approach if agents fail
+    return await this.queryLegacy(question);
+  }
+
+  /**
+   * Legacy query method (backward compatibility)
+   */
+  private async queryLegacy(question: string): Promise<string> {
     // Retrieve relevant documents (fetch more and rerank)
-    const retrieved = await this.vectorStore.similaritySearch(question, 8);
+    const retrieved = await this.vectorStore!.similaritySearch(question, 8);
 
     // Simple lexical reranking to improve relevance (cheap fallback to no extra infra)
-    // This is used to improve the relevance of the retrieved documents by ranking them based on their similarity to the question.
     const relevantDocs = this.rerankDocuments(question, retrieved).slice(0, 6);
 
     // Try to fetch live data from Blizzard API if question seems related
-    let blizzardContext = "";
-    try {
-      // Simple keyword matching for demonstration
-      const hasRealm = question.toLowerCase().includes("realm");
-      if (hasRealm) {
-        // Match realm name - includes letters, numbers, hyphens, and apostrophes
-        // Examples: "Area-52", "Burning Blade", "Kil'jaeden"
-        const re = /realm\s+([\w-']+(?:\s+[\w-']+)*)/i;
-        const m = re.exec(question);
-        if (m?.[1]) {
-          const realmSlug = m[1].toLowerCase().replace(/\s+/g, "-").replace(/'/g, "");
-          const realmData = await this.blizzardService.getRealmData(realmSlug);
-          blizzardContext = `\n\nLive Blizzard API Data:\n${JSON.stringify(realmData, null, 2)}`;
-        }
-      }
-    } catch (error) {
-      this.logger.warn("Could not fetch Blizzard API data:", error);
-    }
+    const blizzardContext = await this.fetchBlizzardContext(question);
+    
     // Build context with a character budget to avoid exceeding LLM input limits
     const { context, docIndexMap } = this.buildContextFromDocs(relevantDocs, 3000);
 
@@ -171,6 +335,29 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
       "All LLM models failed verification or unavailable, returning retrieved context",
     );
     return `Based on the World of Warcraft knowledge base (retrieved documents):\n\n${context}${blizzardContext}\n\n⚠️ Note: The system could not produce a verified AI answer; please check the sources above.`;
+  }
+
+  /**
+   * Fetch Blizzard API context if relevant to the question
+   */
+  private async fetchBlizzardContext(question: string): Promise<string> {
+    try {
+      // Simple keyword matching for demonstration
+      const hasRealm = question.toLowerCase().includes("realm");
+      if (hasRealm) {
+        // Match realm name - includes letters, numbers, hyphens, and apostrophes
+        const re = /realm\s+([\w-']+(?:\s+[\w-']+)*)/i;
+        const m = re.exec(question);
+        if (m?.[1]) {
+          const realmSlug = m[1].toLowerCase().replace(/\s+/g, "-").replace(/'/g, "");
+          const realmData = await this.blizzardService.getRealmData(realmSlug);
+          return `\n\nLive Blizzard API Data:\n${JSON.stringify(realmData, null, 2)}`;
+        }
+      }
+    } catch (error) {
+      this.logger.warn("Could not fetch Blizzard API data:", error);
+    }
+    return "";
   }
 
   /** Try a list of models with retries, verification and backoff. Returns verified answer or empty string */
@@ -356,5 +543,183 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
    */
   private sleep(ms: number) {
     return new Promise((res) => setTimeout(res, ms));
+  }
+
+  /**
+   * Get system health status including agent and model health
+   */
+  async getSystemHealth(): Promise<{
+    status: 'healthy' | 'degraded' | 'unhealthy';
+    agents: Record<string, boolean>;
+    models: Record<string, boolean>;
+    vectorStore: boolean;
+  }> {
+    const health = {
+      status: 'healthy' as const,
+      agents: {} as Record<string, boolean>,
+      models: {} as Record<string, boolean>,
+      vectorStore: !!this.vectorStore,
+    };
+
+    // Check agent health
+    if (this.similarityAgent) {
+      health.agents['similarity'] = await this.similarityAgent.isHealthy();
+    }
+    if (this.generationAgent) {
+      health.agents['generation'] = await this.generationAgent.isHealthy();
+    }
+
+    // Check model health for primary models
+    for (const modelType of Object.values(ModelType)) {
+      const models = this.config.models.primary[modelType];
+      for (const modelName of models) {
+        try {
+          health.models[modelName] = await this.modelFactory.checkModelHealth(modelName);
+        } catch (error) {
+          health.models[modelName] = false;
+        }
+      }
+    }
+
+    // Determine overall status
+    const agentHealthy = Object.values(health.agents).every(Boolean);
+    const modelHealthy = Object.values(health.models).some(Boolean); // At least one model healthy
+    
+    if (!health.vectorStore || !agentHealthy || !modelHealthy) {
+      health.status = Object.values(health.models).filter(Boolean).length > 0 ? 'degraded' : 'unhealthy';
+    }
+
+    return health;
+  }
+
+  /**
+   * Get configuration information
+   */
+  getConfiguration(): {
+    models: { primary: string[]; fallback: string[] };
+    agents: string[];
+    retrieval: { topK: number; reranking: boolean };
+    generation: { verification: boolean; citations: boolean };
+  } {
+    const primaryModels = Object.values(this.config.models.primary).flat();
+    const fallbackModels = Object.values(this.config.models.fallback).flat();
+    const enabledAgents = Object.entries(this.config.agents.enabled)
+      .filter(([, enabled]) => enabled)
+      .map(([type]) => type);
+
+    return {
+      models: {
+        primary: primaryModels,
+        fallback: fallbackModels,
+      },
+      agents: enabledAgents,
+      retrieval: {
+        topK: this.config.retrieval.defaultTopK,
+        reranking: this.config.retrieval.rerankingEnabled,
+      },
+      generation: {
+        verification: this.config.generation.verificationEnabled,
+        citations: this.config.generation.requireCitations,
+      },
+    };
+  }
+
+  /**
+   * Test different similarity models with a sample query
+   */
+  async testSimilarityModels(
+    sourceSentence: string,
+    targetSentences: string[],
+  ): Promise<Record<string, { success: boolean; scores?: number[]; error?: string; responseTime: number }>> {
+    const results: Record<string, any> = {};
+    const similarityModels = this.config.models.primary[ModelType.SIMILARITY];
+
+    for (const modelName of similarityModels) {
+      const startTime = Date.now();
+      try {
+        const client = await this.modelFactory.createClient(modelName) as SimilarityClient;
+        const response = await client.calculateSimilarity(sourceSentence, targetSentences);
+        
+        results[modelName] = {
+          success: response.success,
+          scores: response.success ? response.data?.scores : undefined,
+          error: response.error,
+          responseTime: Date.now() - startTime,
+        };
+      } catch (error) {
+        results[modelName] = {
+          success: false,
+          error: error.message,
+          responseTime: Date.now() - startTime,
+        };
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Test different text generation models with a sample prompt
+   */
+  async testGenerationModels(
+    prompt: string,
+  ): Promise<Record<string, { success: boolean; text?: string; error?: string; responseTime: number }>> {
+    const results: Record<string, any> = {};
+    const generationModels = this.config.models.primary[ModelType.TEXT_GENERATION];
+
+    for (const modelName of generationModels) {
+      const startTime = Date.now();
+      try {
+        const client = await this.modelFactory.createClient(modelName) as TextGenerationClient;
+        const response = await client.generate(prompt, {
+          maxNewTokens: 100,
+          temperature: 0.7,
+        });
+        
+        results[modelName] = {
+          success: response.success,
+          text: response.success ? response.data?.generatedText : undefined,
+          error: response.error,
+          responseTime: Date.now() - startTime,
+        };
+      } catch (error) {
+        results[modelName] = {
+          success: false,
+          error: error.message,
+          responseTime: Date.now() - startTime,
+        };
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Get statistics about the RAG system
+   */
+  getStatistics(): {
+    vectorStore: { documentCount: number };
+    agents: { registered: number; healthy: number };
+    models: { registered: number; types: Record<ModelType, number> };
+  } {
+    const modelsByType: Record<ModelType, number> = {} as any;
+    
+    for (const modelType of Object.values(ModelType)) {
+      modelsByType[modelType] = this.config.models.primary[modelType].length;
+    }
+
+    return {
+      vectorStore: {
+        documentCount: this.vectorStore?.memoryVectors?.length || 0,
+      },
+      agents: {
+        registered: this.orchestrator.getWorkflowStats().totalAgents,
+        healthy: 0, // Would need async health checks
+      },
+      models: {
+        registered: Object.values(this.config.models.primary).flat().length,
+        types: modelsByType,
+      },
+    };
   }
 }
