@@ -18,7 +18,7 @@ export class RagService implements OnModuleInit {
   private vectorStore: MemoryVectorStore | null = null;
   private readonly embeddings: HuggingFaceInferenceEmbeddings;
   private readonly apiKey: string;
-  private readonly dataPath = path.join(process.cwd(), "data", "initial-knowledge.csv");
+  private readonly dataDir = path.join(process.cwd(), "data");
 
   constructor(
     private readonly configService: ConfigService,
@@ -55,28 +55,45 @@ export class RagService implements OnModuleInit {
   }
 
   /**
-   * Load initial documents from CSV file
+   * Load initial documents from all CSV files in data directory
    */
   private async loadInitialDocuments(): Promise<Document[]> {
+    if (!fs.existsSync(this.dataDir)) {
+      this.logger.warn(`Data directory not found at ${this.dataDir}, using empty knowledge base`);
+      return [];
+    }
+
+    const csvFiles = fs.readdirSync(this.dataDir).filter(file => file.endsWith('.csv'));
+    this.logger.log(`Found ${csvFiles.length} CSV files to load`);
+
+    const allDocuments: Document[] = [];
+
+    for (const csvFile of csvFiles) {
+      const filePath = path.join(this.dataDir, csvFile);
+      const docs = await this.loadCsvFile(filePath, csvFile);
+      allDocuments.push(...docs);
+    }
+
+    this.logger.log(`Loaded total of ${allDocuments.length} rows from all CSV files`);
+    return allDocuments;
+  }
+
+  /**
+   * Load documents from a single CSV file
+   */
+  private async loadCsvFile(filePath: string, fileName: string): Promise<Document[]> {
     return new Promise((resolve, reject) => {
-      const documents: Document[] = [];
+      const rows: Document[] = [];
 
-      if (!fs.existsSync(this.dataPath)) {
-        this.logger.warn(`CSV file not found at ${this.dataPath}, using empty knowledge base`);
-        resolve([]);
-        return;
-      }
-
-      fs.createReadStream(this.dataPath)
+      fs.createReadStream(filePath)
         .pipe(csvParser())
         .on("data", (row) => {
-          // Filter out empty/undefined content and trim whitespace
           if (row.content && row.content.trim().length > 0) {
-            documents.push(
+            rows.push(
               new Document({
                 pageContent: row.content.trim(),
                 metadata: {
-                  source: "knowledge-base",
+                  source: fileName.replace('.csv', ''),
                   topic: row.topic || "general",
                 },
               }),
@@ -84,11 +101,11 @@ export class RagService implements OnModuleInit {
           }
         })
         .on("end", () => {
-          this.logger.log(`Loaded ${documents.length} documents from CSV`);
-          resolve(documents);
+          this.logger.log(`Loaded ${rows.length} rows from ${fileName}`);
+          resolve(rows);
         })
         .on("error", (error) => {
-          this.logger.error("Error reading CSV file:", error);
+          this.logger.error(`Error reading CSV file ${fileName}:`, error);
           reject(error);
         });
     });
