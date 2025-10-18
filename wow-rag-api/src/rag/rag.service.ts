@@ -50,8 +50,9 @@ export class RagService implements OnModuleInit {
     // MemoryVectorStore doesn't persist, so always create from docs
     this.logger.log("Creating new vector store from CSV data");
     const docs = await this.loadInitialDocuments();
+    this.allLoadedDocs = docs; // Store for keyword search
     this.vectorStore = await MemoryVectorStore.fromDocuments(docs, this.embeddings);
-    this.logger.log("Vector store created in memory");
+    this.logger.log(`Vector store created with ${docs.length} documents in memory`);
   }
 
   /**
@@ -111,6 +112,102 @@ export class RagService implements OnModuleInit {
     });
   }
 
+  private allLoadedDocs: Document[] = [];
+
+  /**
+   * Keyword-based search as fallback (searches in loaded documents)
+   */
+  private async keywordSearch(question: string, limit: number): Promise<Document[]> {
+    const qLower = question.toLowerCase();
+    const qTokens = qLower.split(/\W+/).filter(t => t.length > 2);
+    
+    return this.allLoadedDocs
+      .map(doc => {
+        const text = (doc.pageContent || '').toLowerCase();
+        const source = (doc.metadata?.source || '').toLowerCase();
+        const topic = (doc.metadata?.topic || '').toLowerCase();
+        
+        let score = 0;
+        qTokens.forEach(token => {
+          if (text.includes(token)) score += 2;
+          if (source.includes(token)) score += 3;
+          if (topic.includes(token)) score += 3;
+        });
+        
+        return { doc, score };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(item => item.doc);
+  }
+
+  /**
+   * Merge vector and keyword results, removing duplicates
+   */
+  private mergeResults(vectorResults: Document[], keywordResults: Document[]): Document[] {
+    const seen = new Set<string>();
+    const merged: Document[] = [];
+    
+    for (const doc of [...vectorResults, ...keywordResults]) {
+      const key = `${doc.metadata?.source}:${doc.pageContent.substring(0, 50)}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(doc);
+      }
+    }
+    
+    return merged;
+  }
+
+  /**
+   * Get all documents in the vector store (for debugging)
+   */
+  async getAllDocuments(): Promise<any> {
+    return {
+      total: this.allLoadedDocs.length,
+      documents: this.allLoadedDocs.map((doc, idx) => ({
+        index: idx + 1,
+        source: doc.metadata?.source,
+        topic: doc.metadata?.topic,
+        content: doc.pageContent,
+      })),
+      sources: [...new Set(this.allLoadedDocs.map(d => d.metadata?.source))],
+      topics: [...new Set(this.allLoadedDocs.map(d => d.metadata?.topic))],
+    };
+  }
+
+  /**
+   * Debug method: retrieve documents without generating answer
+   */
+  async debugQuery(question: string): Promise<any> {
+    if (!this.vectorStore) {
+      throw new Error("Vector store not initialized");
+    }
+    
+    const retrieved = await this.vectorStore.similaritySearch(question, 8);
+    const reranked = this.rerankDocuments(question, retrieved).slice(0, 6);
+    const { context, docIndexMap } = this.buildContextFromDocs(reranked, 3000);
+    
+    return {
+      question,
+      totalRetrieved: retrieved.length,
+      retrievedDocs: retrieved.map((doc, idx) => ({
+        rank: idx + 1,
+        source: doc.metadata?.source,
+        topic: doc.metadata?.topic,
+        content: doc.pageContent,
+      })),
+      topReranked: reranked.map((doc, idx) => ({
+        rank: idx + 1,
+        source: doc.metadata?.source,
+        topic: doc.metadata?.topic,
+        content: doc.pageContent,
+      })),
+      contextUsed: context,
+    };
+  }
+
   /**
    * Add custom documents to the knowledge base
    */
@@ -135,12 +232,25 @@ export class RagService implements OnModuleInit {
     if (!this.vectorStore) {
       throw new Error("Vector store not initialized");
     }
-    // Retrieve relevant documents (fetch more and rerank)
-    const retrieved = await this.vectorStore.similaritySearch(question, 8);
+    // Hybrid retrieval: vector search + keyword filter
+    const vectorResults = await this.vectorStore.similaritySearch(question, 20);
+    const keywordResults = await this.keywordSearch(question, 10);
+    
+    // Merge and deduplicate
+    const retrieved = this.mergeResults(vectorResults, keywordResults);
+    
+    this.logger.log(`Retrieved ${retrieved.length} documents (vector + keyword hybrid)`);
+    retrieved.slice(0, 10).forEach((doc, idx) => {
+      this.logger.log(`Retrieved ${idx + 1} [${doc.metadata?.source}/${doc.metadata?.topic}]: ${doc.pageContent.substring(0, 80)}...`);
+    });
 
-    // Simple lexical reranking to improve relevance (cheap fallback to no extra infra)
-    // This is used to improve the relevance of the retrieved documents by ranking them based on their similarity to the question.
+    // Rerank with lexical scoring
     const relevantDocs = this.rerankDocuments(question, retrieved).slice(0, 6);
+    
+    this.logger.log(`After reranking, using top ${relevantDocs.length} documents`);
+    relevantDocs.forEach((doc, idx) => {
+      this.logger.log(`Reranked ${idx + 1} [${doc.metadata?.source}/${doc.metadata?.topic}]: ${doc.pageContent.substring(0, 80)}...`);
+    });
 
     // Try to fetch live data from Blizzard API if question seems related
     let blizzardContext = "";
@@ -165,14 +275,22 @@ export class RagService implements OnModuleInit {
     const { context, docIndexMap } = this.buildContextFromDocs(relevantDocs, 3000);
 
     // Build prompt template instructing the model to cite sources and be grounded
-    const prompt = `You are a helpful assistant answering questions strictly using only the supplied information and live data. Be concise and factual. For any factual claim include citations to the provided documents using the notation [doc:N]. If you cannot answer confidently from the provided information, say "I don't know" and list the relevant documents.
+    const prompt = `You are a factual assistant. Answer the question using ONLY the information provided below.
+
+RULES:
+- Answer directly and concisely
+- Use ONLY facts from the Information section
+- Cite sources with [doc:1], [doc:2]
+- If not in documents, say "I don't know"
+- DO NOT repeat the question
+- DO NOT add external knowledge
 
 Information:
 ${context}${blizzardContext}
 
 Question: ${question}
 
-Answer (include citations like [doc:1], [doc:2] when applicable):`;
+Direct answer:`;
 
     // Try models with verification and backoff
     // Note: similarity models are not suitable for text generation, so we use text generation models
@@ -185,9 +303,10 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
 
     // As a safe fallback, return the retrieved context with guidance
     this.logger.warn(
-      "All LLM models failed verification or unavailable, returning retrieved context",
+      "All LLM models failed verification, returning retrieved documents directly",
     );
-    return `Based on the World of Warcraft knowledge base (retrieved documents):\n\n${context}${blizzardContext}\n\n⚠️ Note: The system could not produce a verified AI answer; please check the sources above.`;
+    const formattedDocs = this.formatDocumentsForUser(relevantDocs);
+    return `Based on the relevant information found:\n\n${formattedDocs}${blizzardContext ? '\n\n**Live Data:**\n' + blizzardContext : ''}`;
   }
 
   /** Try a list of models with retries, verification and backoff. Returns verified answer or empty string */
@@ -212,6 +331,15 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
           }
 
           this.logger.log(`Model ${model} returned an answer, running verifier`);
+          
+          // First check: Simple lexical verification - does answer contain words from context?
+          const lexicalCheck = this.simpleLexicalVerification(generated.trim(), context);
+          if (!lexicalCheck.valid) {
+            this.logger.warn(`Model ${model} failed lexical verification: ${lexicalCheck.reason}`);
+            continue;
+          }
+          
+          // Second check: LLM-based verification
           const verification = await this.verifyAnswer(
             model,
             generated.trim(),
@@ -220,7 +348,7 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
           );
           if (verification?.confident) return generated.trim();
           this.logger.warn(
-            `Model ${model} verification failed or not confident: ${verification?.reason || "unknown"}`,
+            `Model ${model} verification failed: ${verification?.reason || "unknown"}`,
           );
         } catch (error) {
           this.logger.error(`Error calling model ${model}: ${error?.message || error}`);
@@ -232,30 +360,81 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
   }
 
   /**
-   * Rerank documents with a cheap lexical overlap scorer.
-   * This provides a simple re-ordering without additional API calls.
-   *
-   * How it works:
-   * - Tokenize the question and each document's content.
-   * - Calculate the overlap score between the question and each document.
-   * - Normalize the overlap score by dividing it by the length of the document's tokens.
-   * - Sort the documents based on their normalized overlap scores.
+   * Generic lexical verification: checks if key terms in answer exist in context
+   */
+  private simpleLexicalVerification(
+    answer: string,
+    context: string,
+  ): { valid: boolean; reason?: string } {
+    const contextLower = context.toLowerCase();
+    const answerLower = answer.toLowerCase();
+    
+    // 1. Check quoted phrases (exact matches required)
+    const quotedPhrases = answer.match(/'([^']+)'|"([^"]+)"/g) || [];
+    for (const phrase of quotedPhrases) {
+      const clean = phrase.replace(/['"]/g, '').toLowerCase();
+      if (clean.length > 5 && !contextLower.includes(clean)) {
+        this.logger.warn(`Verification failed: Quoted "${clean}" not in context`);
+        return { valid: false, reason: `Quoted phrase not found in context` };
+      }
+    }
+    
+    // 2. Check multi-word proper nouns (likely invented names)
+    const properNouns = answer.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b/g) || [];
+    for (const noun of properNouns) {
+      const nounLower = noun.toLowerCase();
+      // Only validate if 3+ words or looks like a title
+      if (noun.split(' ').length >= 2 && !contextLower.includes(nounLower)) {
+        this.logger.warn(`Verification failed: Proper noun "${noun}" not in context`);
+        return { valid: false, reason: `Multi-word proper noun not found in context` };
+      }
+    }
+    
+    // 3. Check that answer doesn't start with the question (repetition check)
+    const answerStart = answerLower.substring(0, 50);
+    if (answerStart.includes('let') && answerStart.includes('tackle') || 
+        answerStart.includes('user is asking')) {
+      this.logger.warn(`Verification failed: Answer repeats/analyzes question`);
+      return { valid: false, reason: `Answer repeats the question` };
+    }
+    
+    return { valid: true };
+  }
+
+  /**
+   * Rerank documents using generic scoring based on lexical overlap and metadata.
    */
   private rerankDocuments(question: string, docs: Document[]): Document[] {
-    // Tokenize the question and each document's content. By tokenizing, we ensure that the overlap score is calculated based on the actual words in the documents, rather than just the number of characters.
-    // How to tokenize: Split the text into words using a regular expression that matches non-word characters.
-    const qTokens = question
-      .toLowerCase()
-      .split(/[^\w']+/)
-      .filter(Boolean);
+    const qLower = question.toLowerCase();
+    const qTokens = qLower.split(/\W+/).filter(t => t.length > 2);
+    
     return docs
       .map((doc) => {
         const text = (doc.pageContent || "").toLowerCase();
-        const tokens = text.split(/[^\w']+/).filter(Boolean);
-        // overlap score
-        const overlap = qTokens.reduce((acc, t) => acc + (tokens.includes(t) ? 1 : 0), 0);
-        const norm = tokens.length ? overlap / tokens.length : 0;
-        return { doc, score: norm };
+        const tokens = text.split(/\W+/).filter(Boolean);
+        const source = (doc.metadata?.source || '').toLowerCase();
+        const topic = (doc.metadata?.topic || '').toLowerCase();
+        
+        let score = 0;
+        
+        // 1. Exact phrase match (very strong signal)
+        if (text.includes(qLower)) score += 10;
+        
+        // 2. Token overlap (TF-IDF style without IDF)
+        const tokenOverlap = qTokens.filter(t => tokens.includes(t)).length;
+        score += (tokenOverlap / Math.max(qTokens.length, 1)) * 5;
+        
+        // 3. Metadata overlap (generic - matches any metadata field)
+        qTokens.forEach(qt => {
+          if (source.includes(qt)) score += 8;
+          if (topic.includes(qt)) score += 6;
+        });
+        
+        // 4. Content in question matches document metadata fields
+        if (source && qLower.includes(source.replace(/_/g, ' '))) score += 12;
+        if (topic && qLower.includes(topic.replace(/_/g, ' '))) score += 10;
+        
+        return { doc, score };
       })
       .sort((a, b) => b.score - a.score)
       .map((x) => x.doc);
@@ -282,6 +461,15 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
       chars += text.length;
     }
     return { context: parts.join("\n"), docIndexMap: map };
+  }
+
+  /** Build user-friendly formatted response from documents */
+  private formatDocumentsForUser(docs: Document[]): string {
+    return docs.map((doc, idx) => {
+      const source = doc.metadata?.source || 'unknown';
+      const sourceName = source.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      return `${idx + 1}. **${sourceName}**\n   ${doc.pageContent}`;
+    }).join('\n\n');
   }
 
   /** Call the HuggingFace Inference API for a given model and prompt. */
@@ -343,7 +531,25 @@ Answer (include citations like [doc:1], [doc:2] when applicable):`;
     docIndexMap: Record<number, Document>,
   ): Promise<{ confident: boolean; reason?: string }> {
     // The verifier prompt asks the model to match citations in the answer against context
-    const verifierPrompt = `You are a verifier. Given the context documents and an answer, check whether each factual claim in the answer is fully supported by the context. If all claims are supported, reply with:\n"VERIFIED\nReason: <short explanation>"\nIf some claims are NOT supported reply with:\n"NOT VERIFIED\nUnsupported: <short list of unsupported claims>"\n\nContext:\n${context}\n\nAnswer:\n${answer}\n\nResult:`;
+    const verifierPrompt = `You are a strict verifier. Check if EVERY word and claim in the answer below comes directly from the context documents.
+
+VERIFICATION RULES:
+1. The answer must quote or paraphrase text that exists in the context
+2. NO external knowledge allowed - if information is not in context, it's NOT VERIFIED
+3. Check that citations [doc:N] reference valid documents
+4. Any made-up facts, names, or details = NOT VERIFIED
+
+Context:
+${context}
+
+Answer:
+${answer}
+
+Respond ONLY with:
+- "VERIFIED" if every claim comes from the context
+- "NOT VERIFIED: <specific invented facts>" if any information was added
+
+Result:`;
 
     try {
       const v = await this.callHfModel(model, verifierPrompt, {});

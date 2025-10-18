@@ -2,8 +2,9 @@
 
 ## Commands
 - **Build**: `pnpm build`
-- **Start Dev**: `pnpm start:dev` (watches files)
+- **Start Dev**: `pnpm start:dev` (watches files, shows debug logs)
 - **Start Prod**: `pnpm start:prod`
+- **Debug RAG**: `POST /rag/debug` endpoint shows retrieved documents (see MONITORING.md)
 - **No test suite**: Project has no test framework configured
 
 ## Architecture
@@ -22,3 +23,4 @@
 - **Types**: Strict null checks enabled, use interfaces in `interfaces/` subdirectories
 - **Error Handling**: Try-catch blocks, logger warnings/errors, throw Error with descriptive messages
 - **Comments**: Only when code is complex (e.g., RAG verification, reranking logic)
+- **Domain-agnostic**: Avoid hardcoded domain-specific values; use metadata and generic patterns

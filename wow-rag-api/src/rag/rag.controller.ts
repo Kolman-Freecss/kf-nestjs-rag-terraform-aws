@@ -20,6 +20,22 @@ export class RagController {
   }
 
   /**
+   * Debug endpoint: See what documents are retrieved without generating answer
+   */
+  @Post('debug')
+  async debug(@Body() dto: QueryDto) {
+    return await this.ragService.debugQuery(dto.question);
+  }
+
+  /**
+   * Get all documents in the vector store
+   */
+  @Post('documents/all')
+  async getAllDocuments() {
+    return await this.ragService.getAllDocuments();
+  }
+
+  /**
    * Add a custom document to the knowledge base
    */
   @Post('documents')
