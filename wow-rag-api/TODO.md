@@ -1,6 +1,15 @@
 # Agents
 
-- [ ] Orchestrate multiple LLM calls for complex queries
+- [ ] Docker vector store 
+- [ ] Avoid classify every query with LLM. Instead we can use there a heuristic to determine if the query is specific or aggregation. And LLM as fallback way.
+- [ ] Improve ranking. Using cross-encoder or BM25 + re-ranker. Instead lexical overlap that is less effective in precision terms than re-ranker cross-encoder.
+- [ ] Decouple responsabilities. Ingest | Retriever | Generator
+- [ ] Queue ingest with worker (BullMQ/Redis)
+- [ ] Observability (Prometheus?)
+  - [ ] LLM Latency
+  - [ ] Fail average
+  - [ ] Indexed documents
+  - [ ] Right score verified
 
 # AWS Infrastructure - Terraform
 
