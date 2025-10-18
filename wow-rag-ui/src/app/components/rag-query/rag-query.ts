@@ -1,9 +1,10 @@
-import { Component, signal, computed, viewChild, effect, ElementRef, ChangeDetectionStrategy } from '@angular/core';
+import { Component, signal, computed, viewChild, effect, ElementRef, ChangeDetectionStrategy, OnDestroy } from '@angular/core';
 import { JsonPipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Rag, RagQueryResponse } from '../../services/rag';
 import gsap from 'gsap';
 import { SplitText } from 'gsap/SplitText';
+import { Subscription } from 'rxjs';
 
 // Register SplitText plugin
 gsap.registerPlugin(SplitText);
@@ -16,7 +17,7 @@ gsap.registerPlugin(SplitText);
   styleUrl: './rag-query.css',
   changeDetection: ChangeDetectionStrategy.OnPush
 })
-export class RagQuery {
+export class RagQuery implements OnDestroy {
   // ViewChild signals (Angular 20)
   readonly answerContainer = viewChild<ElementRef>('answerContainer');
   readonly answerText = viewChild<ElementRef>('answerText');
@@ -27,6 +28,9 @@ export class RagQuery {
   readonly response = signal<RagQueryResponse | null>(null);
   readonly loading = signal(false);
   readonly error = signal('');
+
+  // Subscription management
+  private subscription: Subscription | null = null;
 
   // Computed signals - Memoized reactive values
   // These are better than methods in templates because they only recalculate when dependencies change
@@ -47,6 +51,10 @@ export class RagQuery {
     });
   }
 
+  ngOnDestroy(): void {
+    this.cancelRequest();
+  }
+
   askQuestion(): void {
     if (this.isQuestionEmpty()) {
       this.error.set('Please enter a question');
@@ -57,16 +65,26 @@ export class RagQuery {
     this.error.set('');
     this.response.set(null);
 
-    this.ragService.query(this.question()).subscribe({
+    this.subscription = this.ragService.query(this.question()).subscribe({
       next: (data) => {
         this.response.set(data);
         this.loading.set(false);
+        this.subscription = null;
       },
       error: (err) => {
         this.error.set(err.error?.message || 'Error querying RAG system');
         this.loading.set(false);
+        this.subscription = null;
       }
     });
+  }
+
+  cancelRequest(): void {
+    if (this.subscription) {
+      this.subscription.unsubscribe();
+      this.subscription = null;
+    }
+    this.loading.set(false);
   }
 
   private animateResponse(): void {

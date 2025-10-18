@@ -1,12 +1,11 @@
 import { Component, signal, computed, ChangeDetectionStrategy } from '@angular/core';
-import { JsonPipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Blizzard, RealmResponse } from '../../services/blizzard';
 
 @Component({
   selector: 'app-blizzard-query',
   standalone: true,
-  imports: [FormsModule, JsonPipe],
+  imports: [FormsModule],
   templateUrl: './blizzard-query.html',
   styleUrl: './blizzard-query.css',
   changeDetection: ChangeDetectionStrategy.OnPush

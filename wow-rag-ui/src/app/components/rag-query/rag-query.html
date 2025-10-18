@@ -15,14 +15,34 @@
       ></textarea>
     </div>
 
-    <button
-      type="button"
-      (click)="askQuestion()"
-      [disabled]="loading()"
-      class="px-8 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-all duration-200 shadow-md hover:shadow-lg"
-    >
-      {{ loading() ? 'Searching...' : 'Ask' }}
-    </button>
+    <div class="flex items-center space-x-4 h-12">
+      @if (!loading()) {
+        <button
+          type="button"
+          (click)="askQuestion()"
+          [disabled]="isQuestionEmpty()"
+          class="px-8 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-all duration-200 shadow-md hover:shadow-lg"
+        >
+          Ask
+        </button>
+      } @else {
+        <div class="flex items-center space-x-4">
+          <div class="loading-dots">
+            <div class="dot"></div>
+            <div class="dot"></div>
+            <div class="dot"></div>
+          </div>
+          <span class="text-gray-600 font-medium">Searching for answers...</span>
+          <button
+            type="button"
+            (click)="cancelRequest()"
+            class="px-6 py-3 bg-red-500 text-white rounded-lg font-medium hover:bg-red-600 transition-all duration-200 shadow-md hover:shadow-lg"
+          >
+            Cancel
+          </button>
+        </div>
+      }
+    </div>
   </div>
 
   @if (hasError()) {
@@ -60,5 +80,5 @@
         </div>
       }
     </div>
-  }
+  } 
 </div>
