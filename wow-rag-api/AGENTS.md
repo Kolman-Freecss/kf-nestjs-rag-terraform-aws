@@ -2,9 +2,10 @@
 
 ## Commands
 - **Build**: `pnpm build`
-- **Start Dev**: `pnpm start:dev` (watches files, shows debug logs)
+- **Start Dev**: `pnpm start:dev` (watches files, shows debug logs with token usage)
 - **Start Prod**: `pnpm start:prod`
 - **Debug RAG**: `POST /rag/debug` endpoint shows retrieved documents (see MONITORING.md)
+- **Context tuning**: See CONTEXT_STRATEGY.md for adjusting doc counts and token limits
 - **No test suite**: Project has no test framework configured
 
 ## Architecture

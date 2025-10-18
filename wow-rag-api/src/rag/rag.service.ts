@@ -115,6 +115,32 @@ export class RagService implements OnModuleInit {
   private allLoadedDocs: Document[] = [];
 
   /**
+   * Classify query type using LLM (aggregation vs specific)
+   */
+  private async classifyQuery(question: string): Promise<boolean> {
+    const prompt = `Classify this question as either SPECIFIC or AGGREGATION.
+
+SPECIFIC: Questions asking about one particular item, fact, or entity.
+Examples: "What is X?", "Tell me about Y", "Which one is Z?"
+
+AGGREGATION: Questions asking about multiple items, counting, listing all.
+Examples: "How many X are there?", "List all Y", "What are the Z?"
+
+Question: ${question}
+
+Answer with only one word: SPECIFIC or AGGREGATION`;
+
+    try {
+      const response = await this.callHfModel("katanemo/Arch-Router-1.5B", prompt, {});
+      const classification = response.trim().toUpperCase();
+      return classification.includes('AGGREGATION');
+    } catch (error) {
+      this.logger.warn('Query classification failed, defaulting to SPECIFIC');
+      return false;
+    }
+  }
+
+  /**
    * Keyword-based search as fallback (searches in loaded documents)
    */
   private async keywordSearch(question: string, limit: number): Promise<Document[]> {
@@ -158,6 +184,39 @@ export class RagService implements OnModuleInit {
     }
     
     return merged;
+  }
+
+  /**
+   * Diversify results to include documents from different sources (for aggregation)
+   */
+  private diversifyResults(docs: Document[], limit: number): Document[] {
+    const result: Document[] = [];
+    const sourceCount = new Map<string, number>();
+    
+    // First pass: take best from each unique source
+    for (const doc of docs) {
+      const source = doc.metadata?.source || 'unknown';
+      const count = sourceCount.get(source) || 0;
+      
+      if (count < 2) { // Max 2 docs per source in first pass
+        result.push(doc);
+        sourceCount.set(source, count + 1);
+      }
+      
+      if (result.length >= limit) break;
+    }
+    
+    // Second pass: fill remaining with highest scored
+    if (result.length < limit) {
+      for (const doc of docs) {
+        if (!result.includes(doc)) {
+          result.push(doc);
+          if (result.length >= limit) break;
+        }
+      }
+    }
+    
+    return result;
   }
 
   /**
@@ -232,9 +291,20 @@ export class RagService implements OnModuleInit {
     if (!this.vectorStore) {
       throw new Error("Vector store not initialized");
     }
+    // Classify query type using LLM
+    const isAggregationQuery = await this.classifyQuery(question);
+    
+    // Config: adjust based on query type
+    // For aggregation: use ALL relevant docs until context budget is exhausted
+    // For specific: limit to top few for precision
+    const maxCharsForContext = isAggregationQuery ? 10000 : 3000;
+    const useAllRelevant = isAggregationQuery;
+    
+    this.logger.log(`Query type: ${isAggregationQuery ? 'AGGREGATION' : 'SPECIFIC'} (context budget: ${maxCharsForContext} chars, use all relevant: ${useAllRelevant})`);
+    
     // Hybrid retrieval: vector search + keyword filter
-    const vectorResults = await this.vectorStore.similaritySearch(question, 20);
-    const keywordResults = await this.keywordSearch(question, 10);
+    const vectorResults = await this.vectorStore.similaritySearch(question, 30);
+    const keywordResults = await this.keywordSearch(question, isAggregationQuery ? 30 : 15);
     
     // Merge and deduplicate
     const retrieved = this.mergeResults(vectorResults, keywordResults);
@@ -245,7 +315,13 @@ export class RagService implements OnModuleInit {
     });
 
     // Rerank with lexical scoring
-    const relevantDocs = this.rerankDocuments(question, retrieved).slice(0, 6);
+    const reranked = this.rerankDocuments(question, retrieved);
+    
+    // For specific queries: take top 6
+    // For aggregation: take ALL until context budget is exhausted (handled in buildContextFromDocs)
+    const relevantDocs = useAllRelevant 
+      ? this.diversifyResults(reranked, reranked.length) // Use all, diversified
+      : reranked.slice(0, 6);
     
     this.logger.log(`After reranking, using top ${relevantDocs.length} documents`);
     relevantDocs.forEach((doc, idx) => {
@@ -271,10 +347,18 @@ export class RagService implements OnModuleInit {
     } catch (error) {
       this.logger.warn("Could not fetch Blizzard API data:", error);
     }
-    // Build context with a character budget to avoid exceeding LLM input limits
-    const { context, docIndexMap } = this.buildContextFromDocs(relevantDocs, 3000);
+    // Build context with a character budget (larger for aggregation queries)
+    const { context, docIndexMap, docsIncluded, docsSkipped } = this.buildContextFromDocs(relevantDocs, maxCharsForContext);
+    
+    // Log context size for monitoring
+    const approxTokens = Math.ceil(context.length / 4); // rough estimate: 1 token ≈ 4 chars
+    this.logger.log(`Context: ${context.length} chars (~${approxTokens} tokens) | Included: ${docsIncluded}/${relevantDocs.length} docs | Skipped: ${docsSkipped}`);
 
     // Build prompt template instructing the model to cite sources and be grounded
+    const aggregationHint = isAggregationQuery 
+      ? '\n- For counting questions, examine ALL documents and count carefully\n- List each item found with its source'
+      : '';
+    
     const prompt = `You are a factual assistant. Answer the question using ONLY the information provided below.
 
 RULES:
@@ -283,7 +367,7 @@ RULES:
 - Cite sources with [doc:1], [doc:2]
 - If not in documents, say "I don't know"
 - DO NOT repeat the question
-- DO NOT add external knowledge
+- DO NOT add external knowledge${aggregationHint}
 
 Information:
 ${context}${blizzardContext}
@@ -442,25 +526,37 @@ Direct answer:`;
 
   /** Build a context string from documents but cap by character budget. Returns a map of docs indices used.
    *
-   * Why? Because we want to ensure that the context string is not too long, and we want to prioritize the documents that are most relevant to the question. Because the LLM may not be able to handle long context strings, we need to cap the length of the context string.
+   * Iterates through documents until the character budget is exhausted.
+   * This allows aggregation queries to include ALL relevant docs up to the limit.
    */
   private buildContextFromDocs(
     docs: Document[],
     maxChars = 3000,
-  ): { context: string; docIndexMap: Record<number, Document> } {
+  ): { context: string; docIndexMap: Record<number, Document>; docsIncluded: number; docsSkipped: number } {
     let chars = 0;
     const parts: string[] = [];
     const map: Record<number, Document> = {};
+    let included = 0;
+    
     for (let i = 0; i < docs.length; i++) {
       const doc = docs[i];
       const header = `[doc:${i + 1} | topic:${doc.metadata?.topic || "unknown"} | source:${doc.metadata?.source || "unknown"}]\n`;
       const text = `${header}${doc.pageContent}\n---\n`;
+      
       if (chars + text.length > maxChars) break;
+      
       parts.push(text);
       map[i + 1] = doc;
       chars += text.length;
+      included++;
     }
-    return { context: parts.join("\n"), docIndexMap: map };
+    
+    return { 
+      context: parts.join("\n"), 
+      docIndexMap: map,
+      docsIncluded: included,
+      docsSkipped: docs.length - included
+    };
   }
 
   /** Build user-friendly formatted response from documents */
