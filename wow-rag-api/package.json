@@ -27,13 +27,23 @@
     "faiss-node": "^0.5.1",
     "hnswlib-node": "^3.0.0",
     "langchain": "^0.3.35",
+    "onnxruntime-node": "^1.23.0",
+    "optional": "^0.1.4",
     "reflect-metadata": "~0.2.2",
-    "rxjs": "^7.8.2"
+    "rxjs": "^7.8.2",
+    "tiktoken": "^1.0.22"
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.10",
     "@nestjs/schematics": "^11.0.8",
     "@types/node": "^24.6.2",
     "typescript": "^5.9.3"
+  },
+  "pnpm": {
+    "allowed-build-scripts": [
+      "sharp",
+      "faiss-node",
+      "hnswlib-node"
+    ]
   }
 }

@@ -1,9 +1,12 @@
 import { Embeddings, EmbeddingsParams } from '@langchain/core/embeddings';
+import { EmbeddingsProvider } from './embeddings.interface';
 
 /**
  * Custom HuggingFace embeddings implementation using Inference API
  */
-export class HuggingFaceEmbeddings extends Embeddings {
+export class HuggingFaceEmbeddings extends Embeddings implements EmbeddingsProvider {
+  readonly providerName = "huggingface";
+  readonly requiresApiKey = true;
   private apiKey: string;
 
   constructor(params: EmbeddingsParams & { apiKey: string }) {

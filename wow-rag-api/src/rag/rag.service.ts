@@ -1,9 +1,12 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { MemoryVectorStore } from "langchain/vectorstores/memory";
-import { HuggingFaceInferenceEmbeddings } from "@langchain/community/embeddings/hf";
 import { Document } from "langchain/document";
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
 import { BlizzardService } from "../blizzard/blizzard.service";
+import { encoding_for_model, type Tiktoken } from "tiktoken";
+import { EmbeddingsProvider, EmbeddingsConfig } from "./embeddings/embeddings.interface";
+import { EmbeddingsFactory } from "./embeddings/embeddings.factory";
 import * as path from "path";
 import * as fs from "fs";
 import * as csvParser from "csv-parser";
@@ -16,25 +19,38 @@ import * as csvParser from "csv-parser";
 export class RagService implements OnModuleInit {
   private readonly logger = new Logger(RagService.name);
   private vectorStore: MemoryVectorStore | null = null;
-  private readonly embeddings: HuggingFaceInferenceEmbeddings;
+  private readonly embeddings: EmbeddingsProvider;
   private readonly apiKey: string;
   private readonly dataDir = path.join(process.cwd(), "data");
+  private readonly textSplitter: RecursiveCharacterTextSplitter;
+  private tokenizer: Tiktoken;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly blizzardService: BlizzardService,
   ) {
     const apiKey = this.configService.get<string>("HUGGINGFACE_API_KEY");
+    const embeddingsProvider = this.configService.get<string>("EMBEDDINGS_PROVIDER") || "huggingface";
 
-    if (!apiKey) {
-      throw new Error("HUGGINGFACE_API_KEY is required");
-    }
+    this.apiKey = apiKey || "";
 
-    this.apiKey = apiKey;
-    this.embeddings = new HuggingFaceInferenceEmbeddings({
-      apiKey,
-      model: "sentence-transformers/all-MiniLM-L6-v2",
+    // Create embeddings provider based on configuration
+    const embeddingsConfig: EmbeddingsConfig = {
+      provider: embeddingsProvider as 'huggingface',
+      apiKey: this.apiKey,
+      modelName: "Xenova/all-MiniLM-L6-v2",
+    };
+
+    this.embeddings = EmbeddingsFactory.create(embeddingsConfig);
+    this.logger.log(`Using embeddings provider: ${this.embeddings.providerName}`);
+
+    this.textSplitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 500,
+      chunkOverlap: 50,
+      separators: ["\n\n", "\n", ". ", ", ", " ", ""],
     });
+
+    this.tokenizer = encoding_for_model("gpt-3.5-turbo");
 
     this.logger.log("RAG Service initialized");
   }
@@ -83,7 +99,7 @@ export class RagService implements OnModuleInit {
    * Load documents from a single CSV file
    */
   private async loadCsvFile(filePath: string, fileName: string): Promise<Document[]> {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       const rows: Document[] = [];
 
       fs.createReadStream(filePath)
@@ -101,9 +117,20 @@ export class RagService implements OnModuleInit {
             );
           }
         })
-        .on("end", () => {
+        .on("end", async () => {
           this.logger.log(`Loaded ${rows.length} rows from ${fileName}`);
-          resolve(rows);
+          
+          const chunkedDocs: Document[] = [];
+          for (const doc of rows) {
+            const splits = await this.textSplitter.createDocuments(
+              [doc.pageContent],
+              [doc.metadata]
+            );
+            chunkedDocs.push(...splits);
+          }
+          
+          this.logger.log(`Split into ${chunkedDocs.length} chunks from ${fileName}`);
+          resolve(chunkedDocs);
         })
         .on("error", (error) => {
           this.logger.error(`Error reading CSV file ${fileName}:`, error);
@@ -246,7 +273,7 @@ Answer with only one word: SPECIFIC or AGGREGATION`;
     
     const retrieved = await this.vectorStore.similaritySearch(question, 8);
     const reranked = this.rerankDocuments(question, retrieved).slice(0, 6);
-    const { context, docIndexMap } = this.buildContextFromDocs(reranked, 3000);
+    const { context, docIndexMap } = this.buildContextFromDocs(reranked, 750);
     
     return {
       question,
@@ -297,10 +324,10 @@ Answer with only one word: SPECIFIC or AGGREGATION`;
     // Config: adjust based on query type
     // For aggregation: use ALL relevant docs until context budget is exhausted
     // For specific: limit to top few for precision
-    const maxCharsForContext = isAggregationQuery ? 10000 : 3000;
+    const maxTokensForContext = isAggregationQuery ? 2500 : 750;
     const useAllRelevant = isAggregationQuery;
     
-    this.logger.log(`Query type: ${isAggregationQuery ? 'AGGREGATION' : 'SPECIFIC'} (context budget: ${maxCharsForContext} chars, use all relevant: ${useAllRelevant})`);
+    this.logger.log(`Query type: ${isAggregationQuery ? 'AGGREGATION' : 'SPECIFIC'} (context budget: ${maxTokensForContext} tokens, use all relevant: ${useAllRelevant})`);
     
     // Hybrid retrieval: vector search + keyword filter
     const vectorResults = await this.vectorStore.similaritySearch(question, 30);
@@ -347,12 +374,12 @@ Answer with only one word: SPECIFIC or AGGREGATION`;
     } catch (error) {
       this.logger.warn("Could not fetch Blizzard API data:", error);
     }
-    // Build context with a character budget (larger for aggregation queries)
-    const { context, docIndexMap, docsIncluded, docsSkipped } = this.buildContextFromDocs(relevantDocs, maxCharsForContext);
+    // Build context with a token budget (larger for aggregation queries)
+    const { context, docIndexMap, docsIncluded, docsSkipped } = this.buildContextFromDocs(relevantDocs, maxTokensForContext);
     
     // Log context size for monitoring
-    const approxTokens = Math.ceil(context.length / 4); // rough estimate: 1 token ≈ 4 chars
-    this.logger.log(`Context: ${context.length} chars (~${approxTokens} tokens) | Included: ${docsIncluded}/${relevantDocs.length} docs | Skipped: ${docsSkipped}`);
+    const actualTokens = this.tokenizer.encode(context).length;
+    this.logger.log(`Context: ${context.length} chars (${actualTokens} tokens) | Included: ${docsIncluded}/${relevantDocs.length} docs | Skipped: ${docsSkipped}`);
 
     // Build prompt template instructing the model to cite sources and be grounded
     const aggregationHint = isAggregationQuery 
@@ -524,16 +551,16 @@ Direct answer:`;
       .map((x) => x.doc);
   }
 
-  /** Build a context string from documents but cap by character budget. Returns a map of docs indices used.
+  /** Build a context string from documents but cap by token budget. Returns a map of docs indices used.
    *
-   * Iterates through documents until the character budget is exhausted.
+   * Iterates through documents until the token budget is exhausted.
    * This allows aggregation queries to include ALL relevant docs up to the limit.
    */
   private buildContextFromDocs(
     docs: Document[],
-    maxChars = 3000,
+    maxTokens = 750,
   ): { context: string; docIndexMap: Record<number, Document>; docsIncluded: number; docsSkipped: number } {
-    let chars = 0;
+    let tokens = 0;
     const parts: string[] = [];
     const map: Record<number, Document> = {};
     let included = 0;
@@ -543,11 +570,12 @@ Direct answer:`;
       const header = `[doc:${i + 1} | topic:${doc.metadata?.topic || "unknown"} | source:${doc.metadata?.source || "unknown"}]\n`;
       const text = `${header}${doc.pageContent}\n---\n`;
       
-      if (chars + text.length > maxChars) break;
+      const textTokens = this.tokenizer.encode(text).length;
+      if (tokens + textTokens > maxTokens) break;
       
       parts.push(text);
       map[i + 1] = doc;
-      chars += text.length;
+      tokens += textTokens;
       included++;
     }
     
