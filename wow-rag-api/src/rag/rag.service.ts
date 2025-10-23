@@ -1,19 +1,22 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import * as csvParser from "csv-parser";
+import * as fs from "fs";
 import { Document } from "langchain/document";
 import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
-import { BlizzardService } from "../blizzard/blizzard.service";
-import { encoding_for_model, type Tiktoken } from "tiktoken";
-import { EmbeddingsProvider, EmbeddingsConfig } from "./embeddings/embeddings.interface";
-import { EmbeddingsFactory } from "./embeddings/embeddings.factory";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
 import * as path from "path";
-import * as fs from "fs";
-import * as csvParser from "csv-parser";
+import { encoding_for_model, type Tiktoken } from "tiktoken";
+import { BlizzardService } from "../blizzard/blizzard.service";
+import { RagWorkflow } from "./agents/workflows";
+import { RagAgent } from "./agents/rag-agent";
+import { LangSmithConfig } from "./agents/langsmith-config";
+import { EmbeddingsFactory } from "./embeddings/embeddings.factory";
+import { EmbeddingsConfig, EmbeddingsProvider } from "./embeddings/embeddings.interface";
 
 /**
- * Simplified RAG Service with basic functionality
- * Uses vector similarity search and LLM to generate responses
+ * RAG Service with Intelligent Agent
+ * Uses a single intelligent agent with LangChain tools for query processing
  */
 @Injectable()
 export class RagService implements OnModuleInit {
@@ -25,14 +28,22 @@ export class RagService implements OnModuleInit {
   private readonly textSplitter: RecursiveCharacterTextSplitter;
   private tokenizer: Tiktoken;
 
+  // RAG system
+  private ragWorkflow: RagWorkflow;
+  private ragAgent: RagAgent;
+
   constructor(
     private readonly configService: ConfigService,
     private readonly blizzardService: BlizzardService,
   ) {
     const apiKey = this.configService.get<string>("HUGGINGFACE_API_KEY");
     const embeddingsProvider = this.configService.get<string>("EMBEDDINGS_PROVIDER") || "huggingface";
+    const langsmithApiKey = this.configService.get<string>("LANGSMITH_API_KEY");
 
     this.apiKey = apiKey || "";
+
+    // Initialize LangSmith tracing
+    LangSmithConfig.initialize(langsmithApiKey);
 
     // Create embeddings provider based on configuration
     const embeddingsConfig: EmbeddingsConfig = {
@@ -52,11 +63,22 @@ export class RagService implements OnModuleInit {
 
     this.tokenizer = encoding_for_model("gpt-3.5-turbo");
 
-    this.logger.log("RAG Service initialized");
+    // Initialize RAG agent
+    this.ragAgent = new RagAgent(this.configService, this.blizzardService);
+
+    // Create RAG workflow
+    this.ragWorkflow = new RagWorkflow(this.ragAgent);
+
+    this.logger.log("RAG Service with Intelligent Agent initialized");
   }
 
   async onModuleInit() {
     await this.initializeVectorStore();
+
+    // Set up agent with vector store after initialization
+    if (this.vectorStore && this.allLoadedDocs) {
+      this.ragWorkflow.initializeVectorStore(this.vectorStore, this.allLoadedDocs);
+    }
   }
 
   /**
@@ -264,6 +286,20 @@ Answer with only one word: SPECIFIC or AGGREGATION`;
   }
 
   /**
+   * Get information about the RAG agent
+   */
+  async getAgentInfo(): Promise<any> {
+    return {
+      agent_name: this.ragAgent.name,
+      agent_description: this.ragAgent.description,
+      langchain_enabled: true,
+      tools_available: 3, // knowledge_search, get_realm_info, get_character_info
+      langsmith_enabled: LangSmithConfig.isEnabled(),
+      system_status: "intelligent-agent"
+    };
+  }
+
+  /**
    * Debug method: retrieve documents without generating answer
    */
   async debugQuery(question: string): Promise<any> {
@@ -312,112 +348,69 @@ Answer with only one word: SPECIFIC or AGGREGATION`;
   }
 
   /**
-   * Query using basic RAG with vector search and text generation
+   * Query using multi-agent system for intelligent routing and processing
    */
   async query(question: string): Promise<string> {
+    this.logger.log(`Processing query with multi-agent system: ${question.substring(0, 100)}...`);
+
+    try {
+      // Log operation to LangSmith if enabled
+      LangSmithConfig.logOperation("query_start", {
+        question: question.substring(0, 200),
+        timestamp: new Date().toISOString()
+      });
+
+      // Use the RAG workflow to process the query
+      const result = await this.ragWorkflow.run({
+        question,
+        metadata: {
+          query_timestamp: new Date().toISOString(),
+          agent_system: "intelligent-agent-v1"
+        }
+      });
+
+      // Log successful completion
+      LangSmithConfig.logOperation("query_complete", {
+        question: question.substring(0, 200),
+        confidence: result.confidence,
+        agent: result.metadata?.routed_agent || result.metadata?.agent,
+        response_length: result.answer.length
+      });
+
+      this.logger.log(`Query completed by agent: ${result.metadata?.routed_agent || result.metadata?.agent} (confidence: ${result.confidence})`);
+
+      return result.answer;
+
+    } catch (error) {
+      this.logger.error(`Multi-agent query failed:`, error);
+
+      // Log error to LangSmith
+      LangSmithConfig.logOperation("query_error", {
+        question: question.substring(0, 200),
+        error: error.message
+      });
+
+      // Fallback to original RAG logic if multi-agent fails
+      this.logger.warn("Falling back to original RAG implementation");
+      return this.fallbackQuery(question);
+    }
+  }
+
+  /**
+   * Fallback query method using original RAG logic
+   */
+  private async fallbackQuery(question: string): Promise<string> {
     if (!this.vectorStore) {
       throw new Error("Vector store not initialized");
     }
-    // Classify query type using LLM
-    const isAggregationQuery = await this.classifyQuery(question);
-    
-    // Config: adjust based on query type
-    // For aggregation: use ALL relevant docs until context budget is exhausted
-    // For specific: limit to top few for precision
-    const maxTokensForContext = isAggregationQuery ? 2500 : 750;
-    const useAllRelevant = isAggregationQuery;
-    
-    this.logger.log(`Query type: ${isAggregationQuery ? 'AGGREGATION' : 'SPECIFIC'} (context budget: ${maxTokensForContext} tokens, use all relevant: ${useAllRelevant})`);
-    
-    // Hybrid retrieval: vector search + keyword filter
-    const vectorResults = await this.vectorStore.similaritySearch(question, 30);
-    const keywordResults = await this.keywordSearch(question, isAggregationQuery ? 30 : 15);
-    
-    // Merge and deduplicate
-    const retrieved = this.mergeResults(vectorResults, keywordResults);
-    
-    this.logger.log(`Retrieved ${retrieved.length} documents (vector + keyword hybrid)`);
-    retrieved.slice(0, 10).forEach((doc, idx) => {
-      this.logger.log(`Retrieved ${idx + 1} [${doc.metadata?.source}/${doc.metadata?.topic}]: ${doc.pageContent.substring(0, 80)}...`);
-    });
 
-    // Rerank with lexical scoring
-    const reranked = this.rerankDocuments(question, retrieved);
-    
-    // For specific queries: take top 6
-    // For aggregation: take ALL until context budget is exhausted (handled in buildContextFromDocs)
-    const relevantDocs = useAllRelevant 
-      ? this.diversifyResults(reranked, reranked.length) // Use all, diversified
-      : reranked.slice(0, 6);
-    
-    this.logger.log(`After reranking, using top ${relevantDocs.length} documents`);
-    relevantDocs.forEach((doc, idx) => {
-      this.logger.log(`Reranked ${idx + 1} [${doc.metadata?.source}/${doc.metadata?.topic}]: ${doc.pageContent.substring(0, 80)}...`);
-    });
+    // Simplified fallback - just return basic similarity search results
+    const docs = await this.vectorStore.similaritySearch(question, 3);
+    const formatted = docs.map((doc, idx) =>
+      `${idx + 1}. ${doc.pageContent.substring(0, 200)}...`
+    ).join('\n\n');
 
-    // Try to fetch live data from Blizzard API if question seems related
-    let blizzardContext = "";
-    try {
-      // Simple keyword matching for demonstration
-      const hasRealm = question.toLowerCase().includes("realm");
-      if (hasRealm) {
-        // Match realm name - includes letters, numbers, hyphens, and apostrophes
-        // Examples: "Area-52", "Burning Blade", "Kil'jaeden"
-        const re = /realm\s+([\w-']+(?:\s+[\w-']+)*)/i;
-        const m = re.exec(question);
-        if (m?.[1]) {
-          const realmSlug = m[1].toLowerCase().replace(/\s+/g, "-").replace(/'/g, "");
-          const realmData = await this.blizzardService.getRealmData(realmSlug);
-          blizzardContext = `\n\nLive Blizzard API Data:\n${JSON.stringify(realmData, null, 2)}`;
-        }
-      }
-    } catch (error) {
-      this.logger.warn("Could not fetch Blizzard API data:", error);
-    }
-    // Build context with a token budget (larger for aggregation queries)
-    const { context, docIndexMap, docsIncluded, docsSkipped } = this.buildContextFromDocs(relevantDocs, maxTokensForContext);
-    
-    // Log context size for monitoring
-    const actualTokens = this.tokenizer.encode(context).length;
-    this.logger.log(`Context: ${context.length} chars (${actualTokens} tokens) | Included: ${docsIncluded}/${relevantDocs.length} docs | Skipped: ${docsSkipped}`);
-
-    // Build prompt template instructing the model to cite sources and be grounded
-    const aggregationHint = isAggregationQuery 
-      ? '\n- For counting questions, examine ALL documents and count carefully\n- List each item found with its source'
-      : '';
-    
-    const prompt = `You are a factual assistant. Answer the question using ONLY the information provided below.
-
-RULES:
-- Answer directly and concisely
-- Use ONLY facts from the Information section
-- Cite sources with [doc:1], [doc:2]
-- If not in documents, say "I don't know"
-- DO NOT repeat the question
-- DO NOT add external knowledge${aggregationHint}
-
-Information:
-${context}${blizzardContext}
-
-Question: ${question}
-
-Direct answer:`;
-
-    // Try models with verification and backoff
-    // Note: similarity models are not suitable for text generation, so we use text generation models
-    const modelList = [
-      "katanemo/Arch-Router-1.5B", // Text generation model
-      "HuggingFaceTB/SmolLM3-3B", // Text generation model
-    ];
-    const answer = await this.tryModelsWithVerification(modelList, prompt, context, docIndexMap);
-    if (answer) return answer;
-
-    // As a safe fallback, return the retrieved context with guidance
-    this.logger.warn(
-      "All LLM models failed verification, returning retrieved documents directly",
-    );
-    const formattedDocs = this.formatDocumentsForUser(relevantDocs);
-    return `Based on the relevant information found:\n\n${formattedDocs}${blizzardContext ? '\n\n**Live Data:**\n' + blizzardContext : ''}`;
+    return `Fallback response - Based on available information:\n\n${formatted}`;
   }
 
   /** Try a list of models with retries, verification and backoff. Returns verified answer or empty string */
