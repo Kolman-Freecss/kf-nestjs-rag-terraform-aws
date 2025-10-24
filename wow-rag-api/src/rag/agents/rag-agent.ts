@@ -6,6 +6,7 @@ import { AgentExecutor, createToolCallingAgent } from "langchain/agents";
 import { Document } from "langchain/document";
 import { MemoryVectorStore } from "langchain/vectorstores/memory";
 import { BlizzardService } from "../../blizzard/blizzard.service";
+import { LocalLLMService } from "../llm/local-llm.service";
 import { BaseAgentAbstract } from "./abstract/base-agent.abstract";
 import { AgentInput, AgentOutput } from "./abstract/base-agent.interface";
 import { AgentTools } from "./tools/agent-tools";
@@ -23,6 +24,7 @@ export class RagAgent extends BaseAgentAbstract {
   constructor(
     private readonly configService: ConfigService,
     private readonly blizzardService: BlizzardService,
+    private readonly localLLMService: LocalLLMService,
   ) {
     super();
     this.agentTools = new AgentTools(blizzardService);
@@ -47,19 +49,43 @@ export class RagAgent extends BaseAgentAbstract {
     }
 
     try {
-      // Get OpenAI API key
+      let llm: any;
+      let llmType = "unknown";
+
+      // Try OpenAI first
       const openaiApiKey = this.configService.get<string>("OPENAI_API_KEY");
-      if (!openaiApiKey) {
-        this.logger.warn("OpenAI API key not found, using fallback mode");
-        return;
+      if (openaiApiKey) {
+        try {
+          llm = new ChatOpenAI({
+            modelName: "gpt-3.5-turbo",
+            temperature: 0.1,
+            openAIApiKey: openaiApiKey,
+          });
+          llmType = "OpenAI";
+          this.logger.log("Using OpenAI LLM");
+        } catch (error) {
+          this.logger.warn("Failed to initialize OpenAI LLM:", error);
+        }
       }
 
-      // Initialize the LLM
-      const llm = new ChatOpenAI({
-        modelName: "gpt-3.5-turbo",
-        temperature: 0.1,
-        openAIApiKey: openaiApiKey,
-      });
+      // Fallback to local LLM if OpenAI is not available
+      if (!llm) {
+        const isLocalAvailable = await this.localLLMService.isAvailable();
+        if (isLocalAvailable) {
+          try {
+            // Create a custom LLM wrapper for local service
+            llm = this.createLocalLLMWrapper();
+          } catch (error) {
+            this.logger.warn("Failed to initialize local LLM:", error);
+          }
+        }
+      }
+
+      // If no LLM is available, use fallback mode
+      if (!llm) {
+        this.logger.warn("No LLM available (OpenAI or local), using fallback mode");
+        return;
+      }
 
       // Get tools
       const tools = this.agentTools.getAllTools(this.vectorStore);
@@ -99,7 +125,7 @@ Question: {input}
         maxIterations: 5,
       });
 
-      this.logger.log("RAG Agent initialized with LangChain tools");
+      this.logger.log(`RAG Agent initialized with LangChain tools using ${llmType} LLM`);
     } catch (error) {
       this.logger.error("Failed to initialize RAG Agent:", error);
       throw error;
@@ -151,6 +177,35 @@ Question: {input}
       this.logger.error("Error processing with LangChain agent:", error);
       return this.fallbackProcess(input);
     }
+  }
+
+  /**
+   * Create a LangChain-compatible wrapper for the local LLM service
+   */
+  private createLocalLLMWrapper(): any {
+    return {
+      async invoke(messages: any[]): Promise<any> {
+        try {
+          const response = await this.localLLMService.chatCompletion(messages);
+          return {
+            content: response.choices[0]?.message?.content || '',
+            additional_kwargs: {},
+          };
+        } catch (error) {
+          this.logger.error("Error in local LLM wrapper:", error);
+          throw error;
+        }
+      },
+      async stream(messages: any[]): Promise<any> {
+        // For now, just return the invoke result
+        const result = await this.invoke(messages);
+        return [result];
+      },
+      bindTools: (tools: any[]) => {
+        // Return a new instance with tools bound
+        return this.createLocalLLMWrapper();
+      },
+    };
   }
 
   /**
@@ -225,14 +280,35 @@ Question: {input}
   }
 
   /**
-   * Generate answer using simple prompt (fallback)
+   * Generate answer using local LLM or simple prompt (fallback)
    */
   private async generateAnswer(question: string, context: string): Promise<string> {
     if (context.trim().length === 0) {
       return "I found relevant information but couldn't generate a specific answer.";
     }
 
-    // Simple extraction: return the most relevant document content
+    // Try to use local LLM if available
+    const isLocalAvailable = await this.localLLMService.isAvailable();
+    if (isLocalAvailable) {
+      try {
+        const systemMessage = `You are an intelligent assistant specialized in World of Warcraft information. 
+Use the provided context to answer questions accurately and comprehensively. 
+If you're unsure about something, say so rather than guessing.`;
+
+        const prompt = `Context:\n${context}\n\nQuestion: ${question}\n\nAnswer:`;
+
+        const answer = await this.localLLMService.generateText(prompt, systemMessage, {
+          temperature: 0.3,
+          maxTokens: 500,
+        });
+
+        return answer || "I couldn't generate a specific answer from the available information.";
+      } catch (error) {
+        this.logger.warn("Failed to use local LLM for answer generation:", error);
+      }
+    }
+
+    // Fallback to simple extraction
     const lines = context.split('\n');
     const relevantContent = lines.slice(0, 5).join('\n');
 

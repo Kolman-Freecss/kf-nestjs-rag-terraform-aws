@@ -1,10 +1,11 @@
 import { Module } from '@nestjs/common';
-import { RagService } from './rag.service';
-import { RagController } from './rag.controller';
 import { BlizzardModule } from '../blizzard/blizzard.module';
+import { LocalLLMModule } from './llm/local-llm.module';
+import { RagController } from './rag.controller';
+import { RagService } from './rag.service';
 
 @Module({
-  imports: [BlizzardModule],
+  imports: [BlizzardModule, LocalLLMModule],
   providers: [RagService],
   controllers: [RagController],
 })
