@@ -123,6 +123,7 @@ Question: {input}
 
     // If agent is not initialized, fall back to simple processing
     if (!this.agentExecutor) {
+      this.logger.warn("RAG Agent not initialized, falling back to simple processing");
       return this.fallbackProcess(input);
     }
 

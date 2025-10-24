@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  embeddings-server:
+    build: ./embeddings-server
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=all-MiniLM-L6-v2
+      - PORT=8000
+    volumes:
+      # Cache models locally to avoid re-downloading
+      - embeddings_cache:/root/.cache/torch/sentence_transformers
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  embeddings_cache:

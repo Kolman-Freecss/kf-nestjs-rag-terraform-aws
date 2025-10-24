@@ -16,4 +16,5 @@ export interface EmbeddingsConfig {
   provider: 'local' | 'huggingface';
   apiKey?: string;
   modelName?: string;
+  apiUrl?: string;
 }

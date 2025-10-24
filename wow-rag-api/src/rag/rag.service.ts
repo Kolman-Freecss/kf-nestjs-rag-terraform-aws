@@ -8,9 +8,9 @@ import { MemoryVectorStore } from "langchain/vectorstores/memory";
 import * as path from "path";
 import { encoding_for_model, type Tiktoken } from "tiktoken";
 import { BlizzardService } from "../blizzard/blizzard.service";
-import { RagWorkflow } from "./agents/workflows";
-import { RagAgent } from "./agents/rag-agent";
 import { LangSmithConfig } from "./agents/langsmith-config";
+import { RagAgent } from "./agents/rag-agent";
+import { RagWorkflow } from "./agents/workflows";
 import { EmbeddingsFactory } from "./embeddings/embeddings.factory";
 import { EmbeddingsConfig, EmbeddingsProvider } from "./embeddings/embeddings.interface";
 
@@ -37,7 +37,8 @@ export class RagService implements OnModuleInit {
     private readonly blizzardService: BlizzardService,
   ) {
     const apiKey = this.configService.get<string>("HUGGINGFACE_API_KEY");
-    const embeddingsProvider = this.configService.get<string>("EMBEDDINGS_PROVIDER") || "huggingface";
+    const embeddingsProvider = this.configService.get<string>("EMBEDDINGS_PROVIDER") || "local";
+    const embeddingsApiUrl = this.configService.get<string>("EMBEDDINGS_API_URL") || "http://localhost:8000";
     const langsmithApiKey = this.configService.get<string>("LANGSMITH_API_KEY");
 
     this.apiKey = apiKey || "";
@@ -47,9 +48,10 @@ export class RagService implements OnModuleInit {
 
     // Create embeddings provider based on configuration
     const embeddingsConfig: EmbeddingsConfig = {
-      provider: embeddingsProvider as 'huggingface',
+      provider: embeddingsProvider as 'local' | 'huggingface',
       apiKey: this.apiKey,
       modelName: "Xenova/all-MiniLM-L6-v2",
+      apiUrl: embeddingsApiUrl,
     };
 
     this.embeddings = EmbeddingsFactory.create(embeddingsConfig);

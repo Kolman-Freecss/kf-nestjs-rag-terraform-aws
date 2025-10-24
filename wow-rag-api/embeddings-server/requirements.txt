@@ -1,0 +1,5 @@
+Flask==2.3.3
+sentence-transformers>=2.3.0
+torch>=2.1.0
+numpy==1.24.3
+huggingface_hub>=0.16.0
