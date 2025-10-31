@@ -1,0 +1,30 @@
+{
+  "name": "wow-rag-langgraph",
+  "version": "1.0.0",
+  "description": "LangGraph workflow for WoW RAG API",
+  "main": "workflow.ts",
+  "scripts": {
+    "dev": "langgraph dev",
+    "build": "langgraph build",
+    "deploy": "langgraph deploy"
+  },
+  "dependencies": {
+    "@langchain/langgraph": "^1.0.0",
+    "@langchain/core": "^0.3.78",
+    "@langchain/openai": "^0.6.14",
+    "@langchain/community": "^0.3.57"
+  },
+  "langgraph": {
+    "studio": {
+      "enabled": true,
+      "port": 8123,
+      "host": "localhost"
+    },
+    "workflow": {
+      "file": "./workflow.ts",
+      "entrypoint": "LangGraphWorkflow"
+    }
+  }
+}
+
+

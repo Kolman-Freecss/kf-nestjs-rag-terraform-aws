@@ -13,10 +13,13 @@ import { RagAgent } from "./agents/rag-agent";
 import { RagWorkflow } from "./agents/workflows";
 import { EmbeddingsFactory } from "./embeddings/embeddings.factory";
 import { EmbeddingsConfig, EmbeddingsProvider } from "./embeddings/embeddings.interface";
+import { LangGraphWorkflow } from "./langgraph/workflow";
+import { WorkflowNodes } from "./langgraph/nodes";
+import { WorkflowEdges } from "./langgraph/edges";
 
 /**
- * RAG Service with Intelligent Agent
- * Uses a single intelligent agent with LangChain tools for query processing
+ * RAG Service with LangGraph Multi-Agent Workflow
+ * Uses LangGraph to orchestrate multiple agents for intelligent query processing
  */
 @Injectable()
 export class RagService implements OnModuleInit {
@@ -28,13 +31,18 @@ export class RagService implements OnModuleInit {
   private readonly textSplitter: RecursiveCharacterTextSplitter;
   private tokenizer: Tiktoken;
 
-  // RAG system
+  // Legacy RAG system (kept for fallback)
   private ragWorkflow: RagWorkflow;
   private ragAgent: RagAgent;
+
+  // LangGraph system (injected via constructor)
 
   constructor(
     private readonly configService: ConfigService,
     private readonly blizzardService: BlizzardService,
+    private readonly workflowNodes: WorkflowNodes,
+    private readonly workflowEdges: WorkflowEdges,
+    private readonly langGraphWorkflow: LangGraphWorkflow,
   ) {
     const apiKey = this.configService.get<string>("HUGGINGFACE_API_KEY");
     const embeddingsProvider = this.configService.get<string>("EMBEDDINGS_PROVIDER") || "local";
@@ -65,22 +73,24 @@ export class RagService implements OnModuleInit {
 
     this.tokenizer = encoding_for_model("gpt-3.5-turbo");
 
-    // Initialize RAG agent
+    // Initialize legacy RAG agent (for fallback)
     this.ragAgent = new RagAgent(this.configService, this.blizzardService);
-
-    // Create RAG workflow
     this.ragWorkflow = new RagWorkflow(this.ragAgent);
 
-    this.logger.log("RAG Service with Intelligent Agent initialized");
+    this.logger.log("RAG Service with LangGraph Multi-Agent Workflow initialized");
   }
 
   async onModuleInit() {
     await this.initializeVectorStore();
 
-    // Set up agent with vector store after initialization
+    // Set up legacy agent with vector store after initialization
     if (this.vectorStore && this.allLoadedDocs) {
       this.ragWorkflow.initializeVectorStore(this.vectorStore, this.allLoadedDocs);
     }
+
+    // Initialize LangGraph workflow
+    this.langGraphWorkflow.initializeWorkflow();
+    this.logger.log("LangGraph workflow initialized and ready");
   }
 
   /**
@@ -288,16 +298,27 @@ Answer with only one word: SPECIFIC or AGGREGATION`;
   }
 
   /**
-   * Get information about the RAG agent
+   * Get information about the RAG agents and workflow
    */
   async getAgentInfo(): Promise<any> {
     return {
-      agent_name: this.ragAgent.name,
-      agent_description: this.ragAgent.description,
-      langchain_enabled: true,
-      tools_available: 3, // knowledge_search, get_realm_info, get_character_info
+      system_type: "langgraph-multi-agent",
+      langgraph_enabled: true,
+      legacy_agent: {
+        name: this.ragAgent.name,
+        description: this.ragAgent.description,
+        langchain_enabled: true,
+        tools_available: 3, // knowledge_search, get_realm_info, get_character_info
+      },
+      langgraph_workflow: {
+        nodes: ["initialize", "rag_agent", "blizzard_agent", "synthesis"],
+        edges: ["afterInitialize", "afterRagAgent", "afterBlizzardAgent", "afterSynthesis"],
+        parallel_execution: true,
+        max_iterations: 3,
+        confidence_threshold: 0.6,
+      },
       langsmith_enabled: LangSmithConfig.isEnabled(),
-      system_status: "intelligent-agent"
+      system_status: "langgraph-multi-agent-active"
     };
   }
 
@@ -350,69 +371,88 @@ Answer with only one word: SPECIFIC or AGGREGATION`;
   }
 
   /**
-   * Query using multi-agent system for intelligent routing and processing
+   * Query using LangGraph multi-agent workflow for intelligent routing and processing
    */
   async query(question: string): Promise<string> {
-    this.logger.log(`Processing query with multi-agent system: ${question.substring(0, 100)}...`);
+    this.logger.log(`Processing query with LangGraph multi-agent workflow: ${question.substring(0, 100)}...`);
 
     try {
       // Log operation to LangSmith if enabled
-      LangSmithConfig.logOperation("query_start", {
+      LangSmithConfig.logOperation("langgraph_query_start", {
         question: question.substring(0, 200),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        workflow_type: "langgraph"
       });
 
-      // Use the RAG workflow to process the query
-      const result = await this.ragWorkflow.run({
+      if (!this.vectorStore) {
+        throw new Error("Vector store not initialized");
+      }
+
+      // Use LangGraph workflow to process the query
+      const result = await this.langGraphWorkflow.execute(
         question,
-        metadata: {
-          query_timestamp: new Date().toISOString(),
-          agent_system: "intelligent-agent-v1"
-        }
-      });
+        this.vectorStore
+      );
 
       // Log successful completion
-      LangSmithConfig.logOperation("query_complete", {
+      LangSmithConfig.logOperation("langgraph_query_complete", {
         question: question.substring(0, 200),
         confidence: result.confidence,
-        agent: result.metadata?.routed_agent || result.metadata?.agent,
-        response_length: result.answer.length
+        agent: result.metadata?.agent,
+        response_length: result.answer.length,
+        documents_used: result.sources.length
       });
 
-      this.logger.log(`Query completed by agent: ${result.metadata?.routed_agent || result.metadata?.agent} (confidence: ${result.confidence})`);
+      this.logger.log(`LangGraph query completed by agent: ${result.metadata?.agent} (confidence: ${result.confidence})`);
 
       return result.answer;
 
     } catch (error) {
-      this.logger.error(`Multi-agent query failed:`, error);
+      this.logger.error(`LangGraph query failed:`, error);
 
       // Log error to LangSmith
-      LangSmithConfig.logOperation("query_error", {
+      LangSmithConfig.logOperation("langgraph_query_error", {
         question: question.substring(0, 200),
-        error: error.message
+        error: error.message,
+        workflow_type: "langgraph"
       });
 
-      // Fallback to original RAG logic if multi-agent fails
-      this.logger.warn("Falling back to original RAG implementation");
-      return this.fallbackQuery(question);
+      // Fallback to legacy RAG workflow if LangGraph fails
+      this.logger.warn("Falling back to legacy RAG workflow");
+      return this.fallbackToLegacyQuery(question);
     }
   }
 
   /**
-   * Fallback query method using original RAG logic
+   * Fallback query method using legacy RAG workflow
    */
-  private async fallbackQuery(question: string): Promise<string> {
-    if (!this.vectorStore) {
-      throw new Error("Vector store not initialized");
+  private async fallbackToLegacyQuery(question: string): Promise<string> {
+    try {
+      // Use the legacy RAG workflow
+      const result = await this.ragWorkflow.run({
+        question,
+        metadata: {
+          query_timestamp: new Date().toISOString(),
+          agent_system: "legacy-fallback"
+        }
+      });
+
+      return result.answer;
+    } catch (error) {
+      this.logger.error("Legacy RAG workflow also failed:", error);
+      
+      // Final fallback - simple similarity search
+      if (!this.vectorStore) {
+        throw new Error("Vector store not initialized");
+      }
+
+      const docs = await this.vectorStore.similaritySearch(question, 3);
+      const formatted = docs.map((doc, idx) =>
+        `${idx + 1}. ${doc.pageContent.substring(0, 200)}...`
+      ).join('\n\n');
+
+      return `Fallback response - Based on available information:\n\n${formatted}`;
     }
-
-    // Simplified fallback - just return basic similarity search results
-    const docs = await this.vectorStore.similaritySearch(question, 3);
-    const formatted = docs.map((doc, idx) =>
-      `${idx + 1}. ${doc.pageContent.substring(0, 200)}...`
-    ).join('\n\n');
-
-    return `Fallback response - Based on available information:\n\n${formatted}`;
   }
 
   /** Try a list of models with retries, verification and backoff. Returns verified answer or empty string */
